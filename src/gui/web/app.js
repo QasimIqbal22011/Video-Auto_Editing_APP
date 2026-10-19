@@ -108,42 +108,55 @@ window.addEventListener('DOMContentLoaded', () => {
 
 const CUSTOM_ICON_BASE = '/static/assets/';
 function customIcon(file, extraClass = '') {
-  return `<img class="custom-ui-icon ${extraClass}" src="${CUSTOM_ICON_BASE}${file}.png" alt="">`;
+  const filename = /\.(png|svg|jpe?g|webp)$/i.test(file) ? file : `${file}.png`;
+  return `<img class="custom-ui-icon ${extraClass}" src="${CUSTOM_ICON_BASE}${filename}" alt="">`;
 }
 
-function replaceFirstSvg(element, file, extraClass = '') {
+function applyCustomIcon(element, file, extraClass = '') {
   if (!element) return;
   const svg = element.querySelector(':scope > svg');
-  if (svg) svg.outerHTML = customIcon(file, extraClass);
+  if (svg) {
+    svg.outerHTML = customIcon(file, extraClass);
+  } else if (!element.querySelector(':scope > .custom-ui-icon')) {
+    element.insertAdjacentHTML('afterbegin', customIcon(file, extraClass));
+  }
 }
 
 function applyCustomIcons() {
-  replaceFirstSvg(document.querySelector('.logo-box'), 'video_helper_app_icon', 'icon-lg');
-  replaceFirstSvg(document.querySelector('.splash-logo-box'), 'video_helper_app_icon', 'icon-lg');
+  applyCustomIcon(document.querySelector('.logo-box'), 'video_helper_app_icon', 'icon-lg');
+  applyCustomIcon(document.querySelector('.splash-logo-box'), 'video_helper_app_icon', 'icon-lg');
 
-  const navIcons = { stitcher: 'icon_audio_stitcher', silence: 'icon_silence_remover', timeline: 'icon_timeline_aligner', zoom: 'icon_zoom_transitions' };
-  document.querySelectorAll('.nav-item[data-tab]').forEach(item => replaceFirstSvg(item, navIcons[item.dataset.tab] || 'icon_workflow_ready'));
+  const navIcons = { stitcher: 'icon_audio_stitcher.svg', silence: 'icon_silence_remover.svg', timeline: 'icon_timeline_aligner.svg', zoom: 'icon_zoom_transitions.svg' };
+  document.querySelectorAll('.nav-item[data-tab]').forEach(item => applyCustomIcon(item, navIcons[item.dataset.tab] || 'icon_workflow_ready'));
 
   const buttonIcons = {
     addFilesBtn: 'icon_add_audio', sortNaturalBtn: 'icon_sort_clips', clearAllBtn: 'icon_clear_all',
-    startStitchBtn: 'icon_export_audio', openFolderBtn: 'icon_browse_folder',
+    browseDestBtn: 'icon_browse_folder', startStitchBtn: 'icon_export_audio', cancelStitchBtn: 'icon_close',
+    openFolderBtn: 'icon_browse_folder', sendToSilenceBtn: 'icon_silence_remover', sendStitchToTimelineBtn: 'icon_timeline_aligner',
     addMoreImagesBtn: 'icon_add_images', realignTimelineBtn: 'icon_realign_timeline',
     exportCueSheetBtn: 'icon_export_csv', clearImagesBtn: 'icon_clear_images', sendToZoomBtn: 'icon_send_to_zoom',
-    browseTimelineDestBtn: 'icon_browse_folder', startRenderVideoBtn: 'icon_video_render',
-    browseZoomDestBtn: 'icon_browse_folder', applyZoomEffectsBtn: 'icon_video_export',
-    zoomPlayAudioBtn: 'icon_play_audio', cancelZoomRenderBtn: 'icon_close', openZoomFolderBtn: 'icon_browse_folder'
+    browseTimelineDestBtn: 'icon_browse_folder', startRenderVideoBtn: 'icon_video_render', cancelTimelineRenderBtn: 'icon_close',
+    openTimelineVideoFolderBtn: 'icon_browse_folder', browseZoomDestBtn: 'icon_browse_folder',
+    applyZoomEffectsBtn: 'icon_video_export', zoomPlayAudioBtn: 'icon_play_audio', cancelZoomRenderBtn: 'icon_close',
+    openZoomFolderBtn: 'icon_browse_folder', changeSilenceFileBtn: 'icon_audio_file', analyzeSilencesBtn: 'icon_analyze_audio',
+    startSilenceRemovalBtn: 'icon_cut_silence', cancelSilenceBtn: 'icon_close', openSilenceFolderBtn: 'icon_browse_folder',
+    sendToStitcherBtn: 'icon_audio_stitcher', sendSilenceToTimelineBtn: 'icon_timeline_aligner',
+    browseSilenceDestBtn: 'icon_browse_folder', changeTimelineAudioBtn: 'icon_audio_file'
   };
-  Object.entries(buttonIcons).forEach(([id, file]) => replaceFirstSvg(document.getElementById(id), file));
+  Object.entries(buttonIcons).forEach(([id, file]) => applyCustomIcon(document.getElementById(id), file));
   const playButton = document.getElementById('zoomPlayAudioBtn');
   if (playButton) playButton.innerHTML = customIcon('icon_play_audio', 'icon-sm');
-  document.querySelectorAll('.success-icon-box').forEach(box => replaceFirstSvg(box, 'icon_success_check', 'icon-lg'));
-  document.querySelectorAll('.timeline-card-del-btn, .clip-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
+  document.querySelectorAll('[data-custom-icon]').forEach(element => {
+    element.innerHTML = customIcon(element.dataset.customIcon, element.dataset.iconSize || 'icon-sm');
+  });
+  document.querySelectorAll('.success-icon-box').forEach(box => applyCustomIcon(box, 'icon_success_check', 'icon-lg'));
+  document.querySelectorAll('.timeline-card-del-btn, .clip-del-btn').forEach(btn => applyCustomIcon(btn, 'icon_close', 'icon-sm'));
 }
 
 function applyGeneratedCustomIcons() {
-  document.querySelectorAll('.clip-play-btn').forEach(btn => replaceFirstSvg(btn, 'icon_play_audio', 'icon-sm'));
-  document.querySelectorAll('.clip-order-btn').forEach(btn => replaceFirstSvg(btn, 'icon_reorder_drag', 'icon-sm'));
-  document.querySelectorAll('.clip-del-btn, .timeline-card-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
+  document.querySelectorAll('.clip-play-btn').forEach(btn => applyCustomIcon(btn, 'icon_play_audio', 'icon-sm'));
+  document.querySelectorAll('.clip-order-btn').forEach(btn => applyCustomIcon(btn, 'icon_reorder_drag', 'icon-sm'));
+  document.querySelectorAll('.clip-del-btn, .timeline-card-del-btn').forEach(btn => applyCustomIcon(btn, 'icon_close', 'icon-sm'));
 }
 
 async function initAppLoadingSequence() {
@@ -1920,8 +1933,9 @@ function initZoomTransitions() {
     });
   });
   zoomTransitionDuration.addEventListener('input', () => {
-    document.getElementById('zoomTransitionDurationDisplay').textContent = `${parseFloat(zoomTransitionDuration.value).toFixed(2)}s`;
+    updateZoomTransitionSlider();
   });
+  updateZoomTransitionSlider();
   zoomApplyBtn.addEventListener('click', executeZoomRender);
   document.getElementById('cancelZoomRenderBtn').addEventListener('click', () => window.pywebview.api.cancel_timeline_video());
   document.getElementById('openZoomFolderBtn').addEventListener('click', () => {
@@ -1971,6 +1985,15 @@ function renderZoomWaveform() {
     bar.style.height = `${pattern[i % pattern.length] + ((i * 7) % 11)}%`;
     waveform.appendChild(bar);
   }
+}
+
+function updateZoomTransitionSlider() {
+  const value = parseFloat(zoomTransitionDuration.value);
+  const min = parseFloat(zoomTransitionDuration.min);
+  const max = parseFloat(zoomTransitionDuration.max);
+  const progress = ((value - min) / (max - min)) * 100;
+  zoomTransitionDuration.style.setProperty('--slider-progress', `${progress}%`);
+  document.getElementById('zoomTransitionDurationDisplay').textContent = `${value.toFixed(2)}s`;
 }
 
 async function executeZoomRender() {
