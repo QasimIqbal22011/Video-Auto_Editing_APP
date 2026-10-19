@@ -96,6 +96,7 @@ function applyTheme(theme) {
 // 2. INITIALIZATION & HARDWARE DETECTION (OpenVox Style Splash Loading)
 // =============================================================================
 window.addEventListener('DOMContentLoaded', () => {
+  applyCustomIcons();
   initTheme();
   initSettings();
   setupEventListeners();
@@ -104,6 +105,46 @@ window.addEventListener('DOMContentLoaded', () => {
   initZoomTransitions();
   initAppLoadingSequence();
 });
+
+const CUSTOM_ICON_BASE = '/static/assets/';
+function customIcon(file, extraClass = '') {
+  return `<img class="custom-ui-icon ${extraClass}" src="${CUSTOM_ICON_BASE}${file}.png" alt="">`;
+}
+
+function replaceFirstSvg(element, file, extraClass = '') {
+  if (!element) return;
+  const svg = element.querySelector(':scope > svg');
+  if (svg) svg.outerHTML = customIcon(file, extraClass);
+}
+
+function applyCustomIcons() {
+  replaceFirstSvg(document.querySelector('.logo-box'), 'video_helper_app_icon', 'icon-lg');
+  replaceFirstSvg(document.querySelector('.splash-logo-box'), 'video_helper_app_icon', 'icon-lg');
+
+  const navIcons = { stitcher: 'icon_audio_stitcher', silence: 'icon_silence_remover', timeline: 'icon_timeline_aligner', zoom: 'icon_zoom_transitions' };
+  document.querySelectorAll('.nav-item[data-tab]').forEach(item => replaceFirstSvg(item, navIcons[item.dataset.tab] || 'icon_workflow_ready'));
+
+  const buttonIcons = {
+    addFilesBtn: 'icon_add_audio', sortNaturalBtn: 'icon_sort_clips', clearAllBtn: 'icon_clear_all',
+    startStitchBtn: 'icon_export_audio', openFolderBtn: 'icon_browse_folder',
+    addMoreImagesBtn: 'icon_add_images', realignTimelineBtn: 'icon_realign_timeline',
+    exportCueSheetBtn: 'icon_export_csv', clearImagesBtn: 'icon_clear_images', sendToZoomBtn: 'icon_send_to_zoom',
+    browseTimelineDestBtn: 'icon_browse_folder', startRenderVideoBtn: 'icon_video_render',
+    browseZoomDestBtn: 'icon_browse_folder', applyZoomEffectsBtn: 'icon_video_export',
+    zoomPlayAudioBtn: 'icon_play_audio', cancelZoomRenderBtn: 'icon_close', openZoomFolderBtn: 'icon_browse_folder'
+  };
+  Object.entries(buttonIcons).forEach(([id, file]) => replaceFirstSvg(document.getElementById(id), file));
+  const playButton = document.getElementById('zoomPlayAudioBtn');
+  if (playButton) playButton.innerHTML = customIcon('icon_play_audio', 'icon-sm');
+  document.querySelectorAll('.success-icon-box').forEach(box => replaceFirstSvg(box, 'icon_success_check', 'icon-lg'));
+  document.querySelectorAll('.timeline-card-del-btn, .clip-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
+}
+
+function applyGeneratedCustomIcons() {
+  document.querySelectorAll('.clip-play-btn').forEach(btn => replaceFirstSvg(btn, 'icon_play_audio', 'icon-sm'));
+  document.querySelectorAll('.clip-order-btn').forEach(btn => replaceFirstSvg(btn, 'icon_reorder_drag', 'icon-sm'));
+  document.querySelectorAll('.clip-del-btn, .timeline-card-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
+}
 
 async function initAppLoadingSequence() {
   function updateSplash(percent, text) {
@@ -466,6 +507,7 @@ function renderClips() {
   }
 
   updateStats();
+  applyGeneratedCustomIcons();
 }
 
 function createClipCard(clip, index) {
@@ -1710,6 +1752,7 @@ function renderTimelineCards() {
 
   startRenderVideoBtn.disabled = !(timelineActiveAudio && alignedTimelineItems.length > 0);
   suggestTimelineVideoOutputPath();
+  applyGeneratedCustomIcons();
 }
 
 function suggestTimelineVideoOutputPath() {
@@ -1836,23 +1879,44 @@ function initZoomTransitions() {
   zoomSuccessDetails = document.getElementById('zoomSuccessDetails');
   zoomVideoPlayer = document.getElementById('zoomVideoPlayer');
 
+  const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
+  const zoomPlayAudioBtn = document.getElementById('zoomPlayAudioBtn');
+  const zoomAudioSeek = document.getElementById('zoomAudioSeek');
+  const zoomAudioTime = document.getElementById('zoomAudioTime');
+  zoomPlayAudioBtn.addEventListener('click', () => {
+    if (zoomAudioPlayer.paused) zoomAudioPlayer.play().catch(() => {});
+    else zoomAudioPlayer.pause();
+  });
+  zoomAudioPlayer.addEventListener('play', () => { zoomPlayAudioBtn.innerHTML = customIcon('icon_pause_audio', 'icon-sm'); });
+  zoomAudioPlayer.addEventListener('pause', () => { zoomPlayAudioBtn.innerHTML = customIcon('icon_play_audio', 'icon-sm'); });
+  zoomAudioPlayer.addEventListener('timeupdate', () => {
+    const duration = Number.isFinite(zoomAudioPlayer.duration) ? zoomAudioPlayer.duration : 0;
+    zoomAudioSeek.value = duration ? (zoomAudioPlayer.currentTime / duration) * 100 : 0;
+    zoomAudioTime.textContent = `${formatSecondsToTime(zoomAudioPlayer.currentTime)} / ${formatSecondsToTime(duration)}`;
+  });
+  zoomAudioSeek.addEventListener('input', () => {
+    if (Number.isFinite(zoomAudioPlayer.duration)) zoomAudioPlayer.currentTime = (zoomAudioSeek.value / 100) * zoomAudioPlayer.duration;
+  });
+  renderZoomWaveform();
+
   document.getElementById('browseZoomDestBtn').addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
     const currentName = zoomOutputPathInput.value.split(/[\\/]/).pop() || 'final_video.mp4';
     const selected = await window.pywebview.api.select_save_destination(currentName);
     if (selected) zoomOutputPathInput.value = selected;
   });
-  document.querySelectorAll('#zoomView .chip[data-zoom-fps]').forEach(chip => {
+  document.querySelectorAll('#zoomView [data-zoom-fps]').forEach(chip => {
     chip.addEventListener('click', () => {
-      document.querySelectorAll('#zoomView .chip[data-zoom-fps]').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('#zoomView [data-zoom-fps]').forEach(c => c.classList.remove('active'));
       chip.classList.add('active');
       document.getElementById('zoomFpsDisplay').textContent = `${chip.dataset.zoomFps} FPS`;
     });
   });
   document.querySelectorAll('input[name="zoomVideoRes"]').forEach(radio => {
     radio.addEventListener('change', () => {
-      document.querySelectorAll('#zoomView .radio-card').forEach(c => c.classList.remove('active'));
-      radio.closest('.radio-card').classList.add('active');
+      document.querySelectorAll('#zoomView .reference-choice').forEach(c => c.classList.remove('active'));
+      radio.closest('.reference-choice').classList.add('active');
+      document.getElementById('zoomEffectsSummary').textContent = radio.value === '4k' ? '4K' : radio.value === '720p' ? '720p' : '1080p';
     });
   });
   zoomTransitionDuration.addEventListener('input', () => {
@@ -1882,7 +1946,7 @@ function setZoomActiveMedia(audioMeta, alignedItems) {
   zoomAudioPlayer.onerror = () => sendClientLog('error', `Zoom workflow audio playback failed for ${audioMeta.path}`);
   document.getElementById('zoomImageCount').textContent = zoomAlignedItems.length;
   document.getElementById('zoomAudioDuration').textContent = audioMeta.duration_formatted;
-  document.getElementById('zoomSequenceStatus').textContent = `${zoomAlignedItems.length} images aligned`;
+  document.getElementById('zoomSequenceStatus').textContent = `${zoomAlignedItems.length} Images`;
   zoomOutputPathInput.value = `final_video_${new Date().toISOString().slice(0, 10)}.mp4`;
   renderZoomCards();
 }
@@ -1892,10 +1956,21 @@ function renderZoomCards() {
   grid.innerHTML = '';
   zoomAlignedItems.forEach((item, index) => {
     const card = document.createElement('div');
-    card.className = 'timeline-card';
+    card.className = 'timeline-card zoom-image-card';
     card.innerHTML = `<div class="timeline-card-thumb-box"><img class="timeline-card-thumb" src="/stream_image?path=${encodeURIComponent(item.path)}" alt="${item.filename}" loading="lazy"><span class="timeline-card-seq-badge">#${index + 1}</span></div><div class="timeline-card-body"><div class="timeline-card-title" title="${item.filename}">${item.filename}</div><div class="timeline-card-timing"><span class="timeline-pill-time">${item.start_formatted} ➔ ${item.end_formatted}</span><span class="timeline-pill-dur">${item.duration_formatted}</span></div></div>`;
     grid.appendChild(card);
   });
+}
+
+function renderZoomWaveform() {
+  const waveform = document.getElementById('zoomWaveform');
+  if (!waveform || waveform.children.length) return;
+  const pattern = [12, 24, 17, 31, 22, 38, 27, 17, 34, 20, 42, 25, 18, 30, 40, 23, 15, 34, 27, 19];
+  for (let i = 0; i < 92; i++) {
+    const bar = document.createElement('span');
+    bar.style.height = `${pattern[i % pattern.length] + ((i * 7) % 11)}%`;
+    waveform.appendChild(bar);
+  }
 }
 
 async function executeZoomRender() {
@@ -1911,7 +1986,7 @@ async function executeZoomRender() {
   const resVal = document.querySelector('input[name="zoomVideoRes"]:checked')?.value || '1080p';
   const sizes = { '1080p': [1920, 1080], '4k': [3840, 2160], '720p': [1280, 720] };
   const [width, height] = sizes[resVal];
-  const fps = parseInt(document.querySelector('#zoomView .chip[data-zoom-fps].active')?.dataset.zoomFps || '30', 10);
+  const fps = parseInt(document.querySelector('#zoomView [data-zoom-fps].active')?.dataset.zoomFps || '30', 10);
   zoomProgressCard.style.display = 'block';
   zoomSuccessCard.style.display = 'none';
   zoomApplyBtn.disabled = true;
