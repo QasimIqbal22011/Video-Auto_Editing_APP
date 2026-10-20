@@ -1836,6 +1836,55 @@ function initZoomTransitions() {
   zoomSuccessDetails = document.getElementById('zoomSuccessDetails');
   zoomVideoPlayer = document.getElementById('zoomVideoPlayer');
 
+  const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
+  const zoomAudioPlayBtn = document.getElementById('zoomAudioPlayBtn');
+  const zoomAudioSeek = document.getElementById('zoomAudioSeek');
+  const zoomAudioCurrentTime = document.getElementById('zoomAudioCurrentTime');
+  const zoomAudioDurationLabel = document.getElementById('zoomAudioDurationLabel');
+  const zoomAudioWaveform = document.getElementById('zoomAudioWaveform');
+  const zoomAudioVolumeBtn = document.querySelector('#zoomAudioControls .audio-volume-button');
+
+  if (zoomAudioWaveform && !zoomAudioWaveform.children.length) {
+    const waveformHeights = [18, 27, 38, 24, 48, 33, 58, 42, 66, 36, 54, 72, 44, 61, 35, 52, 70, 43, 29, 47, 63, 35, 55, 74, 42, 31, 57, 68, 46, 60, 35, 51, 72, 38, 26, 48, 65, 42, 58, 31, 49, 67, 39, 55, 72, 44, 29, 50, 64, 37, 57, 75, 43, 31, 54, 68, 40, 58, 34, 50, 70, 45, 30, 48, 64];
+    waveformHeights.forEach(height => {
+      const bar = document.createElement('span');
+      bar.style.height = `${height}%`;
+      zoomAudioWaveform.appendChild(bar);
+    });
+  }
+
+  const formatPlayerTime = seconds => {
+    if (!Number.isFinite(seconds)) return '00:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+  const updateAudioTransport = () => {
+    const duration = zoomAudioPlayer.duration || 0;
+    const position = duration ? (zoomAudioPlayer.currentTime / duration) * 100 : 0;
+    zoomAudioSeek.value = position;
+    zoomAudioCurrentTime.textContent = formatPlayerTime(zoomAudioPlayer.currentTime);
+    zoomAudioDurationLabel.textContent = formatPlayerTime(duration);
+    zoomAudioSeek.style.setProperty('--seek-progress', `${position}%`);
+    document.body.classList.toggle('zoom-audio-playing', !zoomAudioPlayer.paused);
+  };
+  zoomAudioPlayBtn.addEventListener('click', () => {
+    if (zoomAudioPlayer.paused) zoomAudioPlayer.play();
+    else zoomAudioPlayer.pause();
+  });
+  zoomAudioSeek.addEventListener('input', () => {
+    if (zoomAudioPlayer.duration) zoomAudioPlayer.currentTime = (parseFloat(zoomAudioSeek.value) / 100) * zoomAudioPlayer.duration;
+    updateAudioTransport();
+  });
+  zoomAudioPlayer.addEventListener('loadedmetadata', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('timeupdate', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('play', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('pause', updateAudioTransport);
+  zoomAudioVolumeBtn.addEventListener('click', () => {
+    zoomAudioPlayer.muted = !zoomAudioPlayer.muted;
+    zoomAudioVolumeBtn.classList.toggle('muted', zoomAudioPlayer.muted);
+  });
+
   document.getElementById('browseZoomDestBtn').addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
     const currentName = zoomOutputPathInput.value.split(/[\\/]/).pop() || 'final_video.mp4';
@@ -1857,7 +1906,10 @@ function initZoomTransitions() {
   });
   zoomTransitionDuration.addEventListener('input', () => {
     document.getElementById('zoomTransitionDurationDisplay').textContent = `${parseFloat(zoomTransitionDuration.value).toFixed(2)}s`;
+    const percentage = ((zoomTransitionDuration.value - zoomTransitionDuration.min) / (zoomTransitionDuration.max - zoomTransitionDuration.min)) * 100;
+    zoomTransitionDuration.style.setProperty('--range-progress', `${percentage}%`);
   });
+  zoomTransitionDuration.dispatchEvent(new Event('input'));
   zoomApplyBtn.addEventListener('click', executeZoomRender);
   document.getElementById('cancelZoomRenderBtn').addEventListener('click', () => window.pywebview.api.cancel_timeline_video());
   document.getElementById('openZoomFolderBtn').addEventListener('click', () => {
@@ -1879,6 +1931,10 @@ function setZoomActiveMedia(audioMeta, alignedItems) {
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
   zoomAudioPlayer.src = `/stream_audio?path=${encodeURIComponent(audioMeta.path)}&t=${Date.now()}`;
   zoomAudioPlayer.load();
+  zoomAudioPlayer.pause();
+  zoomAudioPlayer.currentTime = 0;
+  document.getElementById('zoomAudioSeek').value = 0;
+  document.getElementById('zoomAudioSeek').style.setProperty('--seek-progress', '0%');
   zoomAudioPlayer.onerror = () => sendClientLog('error', `Zoom workflow audio playback failed for ${audioMeta.path}`);
   document.getElementById('zoomImageCount').textContent = zoomAlignedItems.length;
   document.getElementById('zoomAudioDuration').textContent = audioMeta.duration_formatted;
