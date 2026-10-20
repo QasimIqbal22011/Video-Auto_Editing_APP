@@ -8,6 +8,7 @@ BASE_DIR = os.path.abspath(SPECPATH)
 # Data files to bundle inside the executable
 datas = [
     (os.path.join(BASE_DIR, 'src', 'gui', 'web'), os.path.join('src', 'gui', 'web')),
+    (os.path.join(BASE_DIR, 'resources', 'ffmpeg-full', 'bin'), os.path.join('resources', 'ffmpeg-full', 'bin')),
     (os.path.join(BASE_DIR, 'resources', 'ffmpeg', 'ffmpeg.exe'), os.path.join('resources', 'ffmpeg')),
 ]
 

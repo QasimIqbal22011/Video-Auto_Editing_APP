@@ -11,12 +11,16 @@ def get_ffmpeg_path() -> str:
     Locates the ffmpeg executable.
     Checks:
     1. PyInstaller bundled path (_MEIPASS)
-    2. Local project resources/ffmpeg/ffmpeg.exe
-    3. System PATH
-    4. imageio_ffmpeg fallback
+    2. Local project resources/ffmpeg-full/bin/ffmpeg.exe
+    3. Local project resources/ffmpeg/ffmpeg.exe
+    4. System PATH
+    5. imageio_ffmpeg fallback
     """
     # 1. Bundled in PyInstaller single-folder or one-file
     if hasattr(sys, '_MEIPASS'):
+        full_bundle_ffmpeg = os.path.join(sys._MEIPASS, 'resources', 'ffmpeg-full', 'bin', 'ffmpeg.exe')
+        if os.path.exists(full_bundle_ffmpeg):
+            return full_bundle_ffmpeg
         bundle_ffmpeg = os.path.join(sys._MEIPASS, 'resources', 'ffmpeg', 'ffmpeg.exe')
         if os.path.exists(bundle_ffmpeg):
             return bundle_ffmpeg
@@ -24,12 +28,18 @@ def get_ffmpeg_path() -> str:
     # Check next to executable if frozen
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
+        exe_full_ffmpeg = os.path.join(exe_dir, 'resources', 'ffmpeg-full', 'bin', 'ffmpeg.exe')
+        if os.path.exists(exe_full_ffmpeg):
+            return exe_full_ffmpeg
         exe_ffmpeg = os.path.join(exe_dir, 'resources', 'ffmpeg', 'ffmpeg.exe')
         if os.path.exists(exe_ffmpeg):
             return exe_ffmpeg
 
     # 2. Workspace resources folder
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    local_full_ffmpeg = os.path.join(base_dir, 'resources', 'ffmpeg-full', 'bin', 'ffmpeg.exe')
+    if os.path.exists(local_full_ffmpeg):
+        return local_full_ffmpeg
     local_ffmpeg = os.path.join(base_dir, 'resources', 'ffmpeg', 'ffmpeg.exe')
     if os.path.exists(local_ffmpeg):
         return local_ffmpeg

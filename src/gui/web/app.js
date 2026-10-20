@@ -72,6 +72,65 @@ window.onunhandledrejection = function(event) {
   sendClientLog('error', 'Unhandled Promise Rejection: ' + reason);
 };
 
+// Shared reference-style audio preview used by every workflow engine.
+function initSharedAudioPreviews() {
+  const audioIds = ['masterAudioPlayer', 'silenceOriginalPlayer', 'silenceCleanPlayer', 'timelineAudioPlayer'];
+  const bars = [18, 27, 38, 24, 48, 33, 58, 42, 66, 36, 54, 72, 44, 61, 35, 52, 70, 43, 29, 47, 63, 35, 55, 74, 42, 31, 57, 68, 46, 60, 35, 51, 72, 38, 26, 48, 65, 42, 58, 31, 49, 67, 39, 55, 72, 44, 29, 50, 64];
+  const formatTime = seconds => {
+    if (!Number.isFinite(seconds)) return '00:00';
+    return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+  };
+
+  audioIds.forEach(audioId => {
+    const audio = document.getElementById(audioId);
+    if (!audio || audio.closest('.reference-audio-player')) return;
+    audio.controls = false;
+    audio.classList.add('shared-audio-native');
+    const player = document.createElement('div');
+    player.className = 'reference-audio-player shared-audio-player';
+    player.innerHTML = `
+      <div class="audio-waveform" aria-hidden="true">${bars.map(height => `<span style="height:${height}%"></span>`).join('')}</div>
+      <div class="audio-transport-row">
+        <button class="audio-play-button" type="button" aria-label="Play audio">
+          <svg class="play-glyph" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.2v13.6c0 .8.9 1.3 1.6.9l10.2-6.8c.6-.4.6-1.3 0-1.7L9.6 4.3C8.9 3.9 8 4.4 8 5.2z"/></svg>
+          <svg class="pause-glyph" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3v14H7zM14 5h3v14h-3z"/></svg>
+        </button>
+        <span class="audio-time audio-current">00:00</span>
+        <input type="range" class="audio-seek" min="0" max="100" value="0" aria-label="Audio playback position">
+        <span class="audio-time audio-duration">00:00</span>
+        <button class="audio-volume-button" type="button" aria-label="Toggle mute">⌁</button>
+        <button class="audio-more-button" type="button" aria-label="Audio options">⋮</button>
+      </div>`;
+    audio.parentNode.insertBefore(player, audio);
+    player.appendChild(audio);
+    const play = player.querySelector('.audio-play-button');
+    const seek = player.querySelector('.audio-seek');
+    const current = player.querySelector('.audio-current');
+    const duration = player.querySelector('.audio-duration');
+    const volume = player.querySelector('.audio-volume-button');
+    const sync = () => {
+      const total = audio.duration || 0;
+      const percent = total ? (audio.currentTime / total) * 100 : 0;
+      seek.value = percent;
+      seek.style.setProperty('--seek-progress', `${percent}%`);
+      current.textContent = formatTime(audio.currentTime);
+      duration.textContent = formatTime(total);
+      player.classList.toggle('audio-playing', !audio.paused);
+    };
+    play.addEventListener('click', () => audio.paused ? audio.play() : audio.pause());
+    seek.addEventListener('input', () => {
+      if (audio.duration) audio.currentTime = (parseFloat(seek.value) / 100) * audio.duration;
+      sync();
+    });
+    volume.addEventListener('click', () => {
+      audio.muted = !audio.muted;
+      volume.classList.toggle('muted', audio.muted);
+    });
+    ['loadedmetadata', 'timeupdate', 'play', 'pause', 'ended'].forEach(eventName => audio.addEventListener(eventName, sync));
+    sync();
+  });
+}
+
 // =============================================================================
 // 1. THEME MANAGEMENT
 // =============================================================================
@@ -96,8 +155,8 @@ function applyTheme(theme) {
 // 2. INITIALIZATION & HARDWARE DETECTION (OpenVox Style Splash Loading)
 // =============================================================================
 window.addEventListener('DOMContentLoaded', () => {
-  applyCustomIcons();
   initTheme();
+  initSharedAudioPreviews();
   initSettings();
   setupEventListeners();
   initSilenceRemover();
@@ -105,46 +164,6 @@ window.addEventListener('DOMContentLoaded', () => {
   initZoomTransitions();
   initAppLoadingSequence();
 });
-
-const CUSTOM_ICON_BASE = '/static/assets/';
-function customIcon(file, extraClass = '') {
-  return `<img class="custom-ui-icon ${extraClass}" src="${CUSTOM_ICON_BASE}${file}.png" alt="">`;
-}
-
-function replaceFirstSvg(element, file, extraClass = '') {
-  if (!element) return;
-  const svg = element.querySelector(':scope > svg');
-  if (svg) svg.outerHTML = customIcon(file, extraClass);
-}
-
-function applyCustomIcons() {
-  replaceFirstSvg(document.querySelector('.logo-box'), 'video_helper_app_icon', 'icon-lg');
-  replaceFirstSvg(document.querySelector('.splash-logo-box'), 'video_helper_app_icon', 'icon-lg');
-
-  const navIcons = { stitcher: 'icon_audio_stitcher', silence: 'icon_silence_remover', timeline: 'icon_timeline_aligner', zoom: 'icon_zoom_transitions' };
-  document.querySelectorAll('.nav-item[data-tab]').forEach(item => replaceFirstSvg(item, navIcons[item.dataset.tab] || 'icon_workflow_ready'));
-
-  const buttonIcons = {
-    addFilesBtn: 'icon_add_audio', sortNaturalBtn: 'icon_sort_clips', clearAllBtn: 'icon_clear_all',
-    startStitchBtn: 'icon_export_audio', openFolderBtn: 'icon_browse_folder',
-    addMoreImagesBtn: 'icon_add_images', realignTimelineBtn: 'icon_realign_timeline',
-    exportCueSheetBtn: 'icon_export_csv', clearImagesBtn: 'icon_clear_images', sendToZoomBtn: 'icon_send_to_zoom',
-    browseTimelineDestBtn: 'icon_browse_folder', startRenderVideoBtn: 'icon_video_render',
-    browseZoomDestBtn: 'icon_browse_folder', applyZoomEffectsBtn: 'icon_video_export',
-    zoomPlayAudioBtn: 'icon_play_audio', cancelZoomRenderBtn: 'icon_close', openZoomFolderBtn: 'icon_browse_folder'
-  };
-  Object.entries(buttonIcons).forEach(([id, file]) => replaceFirstSvg(document.getElementById(id), file));
-  const playButton = document.getElementById('zoomPlayAudioBtn');
-  if (playButton) playButton.innerHTML = customIcon('icon_play_audio', 'icon-sm');
-  document.querySelectorAll('.success-icon-box').forEach(box => replaceFirstSvg(box, 'icon_success_check', 'icon-lg'));
-  document.querySelectorAll('.timeline-card-del-btn, .clip-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
-}
-
-function applyGeneratedCustomIcons() {
-  document.querySelectorAll('.clip-play-btn').forEach(btn => replaceFirstSvg(btn, 'icon_play_audio', 'icon-sm'));
-  document.querySelectorAll('.clip-order-btn').forEach(btn => replaceFirstSvg(btn, 'icon_reorder_drag', 'icon-sm'));
-  document.querySelectorAll('.clip-del-btn, .timeline-card-del-btn').forEach(btn => replaceFirstSvg(btn, 'icon_close', 'icon-sm'));
-}
 
 async function initAppLoadingSequence() {
   function updateSplash(percent, text) {
@@ -507,7 +526,6 @@ function renderClips() {
   }
 
   updateStats();
-  applyGeneratedCustomIcons();
 }
 
 function createClipCard(clip, index) {
@@ -1590,7 +1608,7 @@ function setTimelineActiveAudio(audioMeta) {
   timelineAudioPlayer.src = `/stream_audio?path=${encodeURIComponent(audioMeta.path)}&t=${Date.now()}`;
 
   timelineAudioDropzone.style.display = 'none';
-  timelineActiveAudioBar.style.display = 'flex';
+  timelineActiveAudioBar.style.display = 'block';
   changeTimelineAudioBtn.style.display = 'inline-block';
 
   statTimelineAudioDur.textContent = audioMeta.duration_formatted;
@@ -1752,7 +1770,6 @@ function renderTimelineCards() {
 
   startRenderVideoBtn.disabled = !(timelineActiveAudio && alignedTimelineItems.length > 0);
   suggestTimelineVideoOutputPath();
-  applyGeneratedCustomIcons();
 }
 
 function suggestTimelineVideoOutputPath() {
@@ -1878,26 +1895,57 @@ function initZoomTransitions() {
   zoomSuccessCard = document.getElementById('zoomSuccessCard');
   zoomSuccessDetails = document.getElementById('zoomSuccessDetails');
   zoomVideoPlayer = document.getElementById('zoomVideoPlayer');
+  const zoomMainColumn = document.querySelector('#zoomView .timeline-main-column');
+  if (zoomMainColumn && zoomSuccessCard) zoomMainColumn.appendChild(zoomSuccessCard);
 
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
-  const zoomPlayAudioBtn = document.getElementById('zoomPlayAudioBtn');
+  const zoomAudioPlayBtn = document.getElementById('zoomAudioPlayBtn');
   const zoomAudioSeek = document.getElementById('zoomAudioSeek');
-  const zoomAudioTime = document.getElementById('zoomAudioTime');
-  zoomPlayAudioBtn.addEventListener('click', () => {
-    if (zoomAudioPlayer.paused) zoomAudioPlayer.play().catch(() => {});
+  const zoomAudioCurrentTime = document.getElementById('zoomAudioCurrentTime');
+  const zoomAudioDurationLabel = document.getElementById('zoomAudioDurationLabel');
+  const zoomAudioWaveform = document.getElementById('zoomAudioWaveform');
+  const zoomAudioVolumeBtn = document.querySelector('#zoomAudioControls .audio-volume-button');
+
+  if (zoomAudioWaveform && !zoomAudioWaveform.children.length) {
+    const waveformHeights = [18, 27, 38, 24, 48, 33, 58, 42, 66, 36, 54, 72, 44, 61, 35, 52, 70, 43, 29, 47, 63, 35, 55, 74, 42, 31, 57, 68, 46, 60, 35, 51, 72, 38, 26, 48, 65, 42, 58, 31, 49, 67, 39, 55, 72, 44, 29, 50, 64, 37, 57, 75, 43, 31, 54, 68, 40, 58, 34, 50, 70, 45, 30, 48, 64];
+    waveformHeights.forEach(height => {
+      const bar = document.createElement('span');
+      bar.style.height = `${height}%`;
+      zoomAudioWaveform.appendChild(bar);
+    });
+  }
+
+  const formatPlayerTime = seconds => {
+    if (!Number.isFinite(seconds)) return '00:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+  const updateAudioTransport = () => {
+    const duration = zoomAudioPlayer.duration || 0;
+    const position = duration ? (zoomAudioPlayer.currentTime / duration) * 100 : 0;
+    zoomAudioSeek.value = position;
+    zoomAudioCurrentTime.textContent = formatPlayerTime(zoomAudioPlayer.currentTime);
+    zoomAudioDurationLabel.textContent = formatPlayerTime(duration);
+    zoomAudioSeek.style.setProperty('--seek-progress', `${position}%`);
+    document.body.classList.toggle('zoom-audio-playing', !zoomAudioPlayer.paused);
+  };
+  zoomAudioPlayBtn.addEventListener('click', () => {
+    if (zoomAudioPlayer.paused) zoomAudioPlayer.play();
     else zoomAudioPlayer.pause();
   });
-  zoomAudioPlayer.addEventListener('play', () => { zoomPlayAudioBtn.innerHTML = customIcon('icon_pause_audio', 'icon-sm'); });
-  zoomAudioPlayer.addEventListener('pause', () => { zoomPlayAudioBtn.innerHTML = customIcon('icon_play_audio', 'icon-sm'); });
-  zoomAudioPlayer.addEventListener('timeupdate', () => {
-    const duration = Number.isFinite(zoomAudioPlayer.duration) ? zoomAudioPlayer.duration : 0;
-    zoomAudioSeek.value = duration ? (zoomAudioPlayer.currentTime / duration) * 100 : 0;
-    zoomAudioTime.textContent = `${formatSecondsToTime(zoomAudioPlayer.currentTime)} / ${formatSecondsToTime(duration)}`;
-  });
   zoomAudioSeek.addEventListener('input', () => {
-    if (Number.isFinite(zoomAudioPlayer.duration)) zoomAudioPlayer.currentTime = (zoomAudioSeek.value / 100) * zoomAudioPlayer.duration;
+    if (zoomAudioPlayer.duration) zoomAudioPlayer.currentTime = (parseFloat(zoomAudioSeek.value) / 100) * zoomAudioPlayer.duration;
+    updateAudioTransport();
   });
-  renderZoomWaveform();
+  zoomAudioPlayer.addEventListener('loadedmetadata', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('timeupdate', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('play', updateAudioTransport);
+  zoomAudioPlayer.addEventListener('pause', updateAudioTransport);
+  zoomAudioVolumeBtn.addEventListener('click', () => {
+    zoomAudioPlayer.muted = !zoomAudioPlayer.muted;
+    zoomAudioVolumeBtn.classList.toggle('muted', zoomAudioPlayer.muted);
+  });
 
   document.getElementById('browseZoomDestBtn').addEventListener('click', async () => {
     if (!window.pywebview || !window.pywebview.api) return;
@@ -1905,23 +1953,25 @@ function initZoomTransitions() {
     const selected = await window.pywebview.api.select_save_destination(currentName);
     if (selected) zoomOutputPathInput.value = selected;
   });
-  document.querySelectorAll('#zoomView [data-zoom-fps]').forEach(chip => {
+  document.querySelectorAll('#zoomView .chip[data-zoom-fps]').forEach(chip => {
     chip.addEventListener('click', () => {
-      document.querySelectorAll('#zoomView [data-zoom-fps]').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('#zoomView .chip[data-zoom-fps]').forEach(c => c.classList.remove('active'));
       chip.classList.add('active');
       document.getElementById('zoomFpsDisplay').textContent = `${chip.dataset.zoomFps} FPS`;
     });
   });
   document.querySelectorAll('input[name="zoomVideoRes"]').forEach(radio => {
     radio.addEventListener('change', () => {
-      document.querySelectorAll('#zoomView .reference-choice').forEach(c => c.classList.remove('active'));
-      radio.closest('.reference-choice').classList.add('active');
-      document.getElementById('zoomEffectsSummary').textContent = radio.value === '4k' ? '4K' : radio.value === '720p' ? '720p' : '1080p';
+      document.querySelectorAll('#zoomView .radio-card').forEach(c => c.classList.remove('active'));
+      radio.closest('.radio-card').classList.add('active');
     });
   });
   zoomTransitionDuration.addEventListener('input', () => {
     document.getElementById('zoomTransitionDurationDisplay').textContent = `${parseFloat(zoomTransitionDuration.value).toFixed(2)}s`;
+    const percentage = ((zoomTransitionDuration.value - zoomTransitionDuration.min) / (zoomTransitionDuration.max - zoomTransitionDuration.min)) * 100;
+    zoomTransitionDuration.style.setProperty('--range-progress', `${percentage}%`);
   });
+  zoomTransitionDuration.dispatchEvent(new Event('input'));
   zoomApplyBtn.addEventListener('click', executeZoomRender);
   document.getElementById('cancelZoomRenderBtn').addEventListener('click', () => window.pywebview.api.cancel_timeline_video());
   document.getElementById('openZoomFolderBtn').addEventListener('click', () => {
@@ -1937,16 +1987,20 @@ function setZoomActiveMedia(audioMeta, alignedItems) {
   zoomActiveAudio = audioMeta;
   zoomAlignedItems = alignedItems.map(item => ({ ...item }));
   document.getElementById('zoomSourceEmpty').style.display = 'none';
-  document.getElementById('zoomSourceActive').style.display = 'flex';
+  document.getElementById('zoomSourceActive').style.display = 'block';
   document.getElementById('zoomAudioName').textContent = audioMeta.filename;
   document.getElementById('zoomAudioMeta').textContent = `${audioMeta.duration_formatted} · ${audioMeta.format_name}`;
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
   zoomAudioPlayer.src = `/stream_audio?path=${encodeURIComponent(audioMeta.path)}&t=${Date.now()}`;
   zoomAudioPlayer.load();
+  zoomAudioPlayer.pause();
+  zoomAudioPlayer.currentTime = 0;
+  document.getElementById('zoomAudioSeek').value = 0;
+  document.getElementById('zoomAudioSeek').style.setProperty('--seek-progress', '0%');
   zoomAudioPlayer.onerror = () => sendClientLog('error', `Zoom workflow audio playback failed for ${audioMeta.path}`);
   document.getElementById('zoomImageCount').textContent = zoomAlignedItems.length;
   document.getElementById('zoomAudioDuration').textContent = audioMeta.duration_formatted;
-  document.getElementById('zoomSequenceStatus').textContent = `${zoomAlignedItems.length} Images`;
+  document.getElementById('zoomSequenceStatus').textContent = `${zoomAlignedItems.length} images aligned`;
   zoomOutputPathInput.value = `final_video_${new Date().toISOString().slice(0, 10)}.mp4`;
   renderZoomCards();
 }
@@ -1956,21 +2010,10 @@ function renderZoomCards() {
   grid.innerHTML = '';
   zoomAlignedItems.forEach((item, index) => {
     const card = document.createElement('div');
-    card.className = 'timeline-card zoom-image-card';
+    card.className = 'timeline-card';
     card.innerHTML = `<div class="timeline-card-thumb-box"><img class="timeline-card-thumb" src="/stream_image?path=${encodeURIComponent(item.path)}" alt="${item.filename}" loading="lazy"><span class="timeline-card-seq-badge">#${index + 1}</span></div><div class="timeline-card-body"><div class="timeline-card-title" title="${item.filename}">${item.filename}</div><div class="timeline-card-timing"><span class="timeline-pill-time">${item.start_formatted} ➔ ${item.end_formatted}</span><span class="timeline-pill-dur">${item.duration_formatted}</span></div></div>`;
     grid.appendChild(card);
   });
-}
-
-function renderZoomWaveform() {
-  const waveform = document.getElementById('zoomWaveform');
-  if (!waveform || waveform.children.length) return;
-  const pattern = [12, 24, 17, 31, 22, 38, 27, 17, 34, 20, 42, 25, 18, 30, 40, 23, 15, 34, 27, 19];
-  for (let i = 0; i < 92; i++) {
-    const bar = document.createElement('span');
-    bar.style.height = `${pattern[i % pattern.length] + ((i * 7) % 11)}%`;
-    waveform.appendChild(bar);
-  }
 }
 
 async function executeZoomRender() {
@@ -1986,7 +2029,7 @@ async function executeZoomRender() {
   const resVal = document.querySelector('input[name="zoomVideoRes"]:checked')?.value || '1080p';
   const sizes = { '1080p': [1920, 1080], '4k': [3840, 2160], '720p': [1280, 720] };
   const [width, height] = sizes[resVal];
-  const fps = parseInt(document.querySelector('#zoomView [data-zoom-fps].active')?.dataset.zoomFps || '30', 10);
+  const fps = parseInt(document.querySelector('#zoomView .chip[data-zoom-fps].active')?.dataset.zoomFps || '30', 10);
   zoomProgressCard.style.display = 'block';
   zoomSuccessCard.style.display = 'none';
   zoomApplyBtn.disabled = true;
