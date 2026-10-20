@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import shutil
 import subprocess
 import tempfile
@@ -115,6 +116,7 @@ class TimelineAligner:
 
     def __init__(self):
         self._current_process: Optional[subprocess.Popen] = None
+        self._aux_processes: set[subprocess.Popen] = set()
         self._is_cancelled = False
         self._lock = threading.Lock()
 
@@ -122,14 +124,18 @@ class TimelineAligner:
         """Cancels an in-flight video rendering process."""
         with self._lock:
             self._is_cancelled = True
-            if self._current_process and self._current_process.poll() is None:
-                try:
-                    self._current_process.terminate()
-                except Exception:
+            processes = set(self._aux_processes)
+            if self._current_process is not None:
+                processes.add(self._current_process)
+            for process in processes:
+                if process.poll() is None:
                     try:
-                        self._current_process.kill()
+                        process.terminate()
                     except Exception:
-                        pass
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
 
     def align_images(
         self,
@@ -289,6 +295,40 @@ class TimelineAligner:
 
         if progress_callback:
             progress_callback(5.0, "Preparing timeline video manifest...")
+
+        # The optional Rust/WGPU backend schedules one output frame at a
+        # time and keeps only the active transition pair resident. It is
+        # preferred for the high-volume zoom workflow when bundled; the
+        # established FFmpeg graph below remains the compatibility fallback.
+        rust_renderer = self._rust_renderer_path()
+        if rust_renderer is not None:
+            try:
+                return self._render_video_rust(
+                    rust_renderer=rust_renderer,
+                    aligned_images=aligned_images,
+                    audio_path=audio_path,
+                    output_path=output_path,
+                    audio_duration=total_audio_dur,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    use_hardware_accel=use_hardware_accel,
+                    zoom_type=zoom_type,
+                    zoom_amount=zoom_amount,
+                    transition_type=transition_type,
+                    transition_duration=transition_duration,
+                    progress_callback=progress_callback,
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                if self._is_cancelled:
+                    raise InterruptedError("Video rendering cancelled by user.") from exc
+                log_error(f"[TimelineAligner] Rust/WGPU renderer failed; using FFmpeg fallback: {exc}")
+                if progress_callback:
+                    progress_callback(8.0, "GPU frame renderer unavailable; switching to FFmpeg fallback...")
+        elif use_hardware_accel and os.environ.get("VIDEOHELPER_DISABLE_RUST_RENDERER") != "1":
+            log_info("[TimelineAligner] Rust/WGPU renderer not bundled; using FFmpeg compatibility renderer.")
 
         render_temp_dir = None
         try:
@@ -597,6 +637,262 @@ class TimelineAligner:
             'image_count': len(aligned_images),
             'resolution': f"{width}x{height}",
             'fps': fps
+        }
+
+    @staticmethod
+    def _rust_renderer_path() -> Optional[str]:
+        if os.environ.get("VIDEOHELPER_DISABLE_RUST_RENDERER") == "1":
+            return None
+        executable = "video_helper_renderer.exe" if sys.platform == "win32" else "video_helper_renderer"
+        candidates = []
+        if getattr(sys, "frozen", False):
+            bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+            candidates.extend([
+                os.path.join(bundle_dir, "resources", "renderer", executable),
+                os.path.join(os.path.dirname(sys.executable), "resources", "renderer", executable),
+            ])
+        else:
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            candidates.append(os.path.join(base_dir, "rust_renderer", "target", "release", executable))
+        return next((path for path in candidates if os.path.isfile(path)), None)
+
+    def _render_video_rust(
+        self,
+        *,
+        rust_renderer: str,
+        aligned_images: List[Dict[str, Any]],
+        audio_path: str,
+        output_path: str,
+        audio_duration: float,
+        width: int,
+        height: int,
+        fps: int,
+        use_hardware_accel: bool,
+        zoom_type: str,
+        zoom_amount: float,
+        transition_type: str,
+        transition_duration: float,
+        progress_callback: Optional[Callable[[float, str], None]],
+    ) -> Dict[str, Any]:
+        ffmpeg_bin = get_ffmpeg_path()
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(out_dir, exist_ok=True)
+        manifest = {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "audioDuration": audio_duration,
+            "zoomType": zoom_type,
+            "zoomAmount": zoom_amount,
+            "transitionType": transition_type,
+            "transitionDuration": transition_duration,
+            "useHardwareAccel": bool(use_hardware_accel),
+            "images": [
+                {
+                    "path": os.path.abspath(str(item["path"])),
+                    "startSec": float(item["start_sec"]),
+                    "endSec": float(item["end_sec"]),
+                    "duration": float(item["duration"]),
+                }
+                for item in aligned_images
+            ],
+        }
+        temp_dir = tempfile.TemporaryDirectory(prefix="vh_rust_render_", dir=out_dir)
+        manifest_path = os.path.join(temp_dir.name, "render.json")
+        staged_output_path = os.path.join(temp_dir.name, "rendered.mp4")
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, separators=(",", ":"))
+
+        if self._is_cancelled:
+            temp_dir.cleanup()
+            raise InterruptedError("Video rendering cancelled by user.")
+
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+        renderer = subprocess.Popen(
+            [rust_renderer, manifest_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+            bufsize=0,
+        )
+        if renderer.stdout is None:
+            renderer.terminate()
+            temp_dir.cleanup()
+            raise RuntimeError("Rust renderer did not provide a frame stream")
+        with self._lock:
+            if self._is_cancelled:
+                renderer.terminate()
+                temp_dir.cleanup()
+                raise InterruptedError("Video rendering cancelled by user.")
+            self._current_process = renderer
+            self._aux_processes.add(renderer)
+
+        encoder = None
+        stderr_tail: List[str] = []
+        renderer_stderr: List[str] = []
+        stderr_thread = None
+        try:
+            direct_d3d12_nvenc = sys.platform == "win32" and use_hardware_accel
+            if direct_d3d12_nvenc:
+                # The Rust sidecar sends already-encoded Annex-B H.264 from
+                # NVENC. FFmpeg now only timestamps/muxes video with AAC audio.
+                cmd = [
+                    ffmpeg_bin, "-y", "-hide_banner",
+                    "-fflags", "+genpts", "-f", "h264", "-framerate", str(fps), "-i", "pipe:0",
+                    "-i", audio_path,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy",
+                ]
+            else:
+                cmd = [
+                    ffmpeg_bin, "-y", "-hide_banner",
+                    "-f", "rawvideo", "-pixel_format", "rgba",
+                    "-video_size", f"{width}x{height}", "-framerate", str(fps),
+                    "-i", "pipe:0", "-i", audio_path,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                ]
+                if use_hardware_accel:
+                    cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-b:v", "8M"])
+                else:
+                    cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+                cmd.extend(["-pix_fmt", "yuv420p"])
+            cmd.extend([
+                "-c:a", "aac", "-b:a", "192k",
+            ])
+            # The direct Annex-B input has no packet PTS/DTS by default. With
+            # -shortest FFmpeg may treat it as finished and omit mapped audio.
+            # -t caps both streams to the timeline's audio duration instead.
+            cmd.extend(["-t", f"{audio_duration:.4f}"])
+            if not direct_d3d12_nvenc:
+                cmd.append("-shortest")
+            cmd.append(staged_output_path)
+            log_info(
+                f"[TimelineAligner] Rust/WGPU frame renderer: {len(aligned_images)} images, "
+                f"{width}x{height}@{fps}; "
+                f"encoder={'in-process D3D12/NVENC' if direct_d3d12_nvenc else ('FFmpeg NVENC' if use_hardware_accel else 'libx264')}."
+            )
+            encoder = subprocess.Popen(
+                cmd,
+                stdin=renderer.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                startupinfo=startupinfo,
+                bufsize=1,
+            )
+            renderer.stdout.close()
+            with self._lock:
+                self._current_process = encoder
+
+            def drain_renderer_stderr() -> None:
+                if renderer.stderr is None:
+                    return
+                for line in renderer.stderr:
+                    message = line.decode("utf-8", "replace").rstrip()
+                    renderer_stderr.append(message)
+                    if len(renderer_stderr) > 40:
+                        renderer_stderr.pop(0)
+                    if message.startswith("RUST_RENDER_NVENC:"):
+                        log_info(f"[TimelineAligner] {message}")
+                    if message.startswith("RUST_RENDER_PROGRESS\t") and progress_callback:
+                        try:
+                            _, completed_frames, total_frames = message.split("\t", 2)
+                            elapsed_sec = min(
+                                audio_duration,
+                                int(completed_frames) / max(1, fps),
+                            )
+                            percent = 10.0 + min(
+                                88.0,
+                                elapsed_sec / max(1.0, audio_duration) * 88.0,
+                            )
+                            progress_callback(
+                                round(percent, 1),
+                                f"Rendering GPU frames ({elapsed_sec:.1f}s / {audio_duration:.1f}s)...",
+                            )
+                        except (ValueError, ZeroDivisionError):
+                            log_error(f"[TimelineAligner] Invalid Rust renderer progress line: {message}")
+
+            stderr_thread = threading.Thread(target=drain_renderer_stderr, name="RustRendererLog", daemon=True)
+            stderr_thread.start()
+
+            time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+            if encoder.stderr is not None:
+                for line in encoder.stderr:
+                    stderr_tail.append(line.rstrip())
+                    if len(stderr_tail) > 40:
+                        stderr_tail.pop(0)
+                    if self._is_cancelled:
+                        encoder.terminate()
+                        renderer.terminate()
+                        raise InterruptedError("Video rendering cancelled by user.")
+                    match = time_regex.search(line)
+                    if match and progress_callback and not direct_d3d12_nvenc:
+                        cur_time = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+                        pct = 10.0 + min(88.0, (cur_time / max(1.0, audio_duration)) * 88.0)
+                        progress_callback(
+                            round(pct, 1),
+                            f"Rendering GPU frames ({cur_time:.1f}s / {audio_duration:.1f}s)..."
+                        )
+            encoder.wait()
+            renderer.wait()
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+
+            if self._is_cancelled:
+                raise InterruptedError("Video rendering cancelled by user.")
+            if renderer.returncode != 0:
+                detail = "\n".join(renderer_stderr[-12:])
+                encoder_detail = "\n".join(stderr_tail[-12:])
+                raise RuntimeError(
+                    f"Rust frame renderer exited with {renderer.returncode}. {detail}\n"
+                    f"FFmpeg encoder output:\n{encoder_detail}"
+                )
+            if encoder.returncode != 0:
+                detail = "\n".join(stderr_tail[-12:])
+                raise RuntimeError(f"FFmpeg encoder exited with {encoder.returncode}. {detail}")
+            if not os.path.isfile(staged_output_path):
+                raise RuntimeError("Rust frame renderer completed without an output file")
+            # Move the finished video out before the sibling temp directory
+            # is cleaned in finally; os.replace is atomic on this volume.
+            os.replace(staged_output_path, output_path)
+        finally:
+            if encoder is not None and encoder.poll() is None:
+                encoder.terminate()
+            if renderer.poll() is None:
+                renderer.terminate()
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+            with self._lock:
+                self._aux_processes.discard(renderer)
+                self._current_process = None
+            temp_dir.cleanup()
+
+        file_size = os.path.getsize(output_path)
+        size_str = f"{file_size / (1024 * 1024):.2f} MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.1f} KB"
+        actual_duration = audio_duration
+        try:
+            actual_duration = get_audio_info(output_path)["duration"]
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(100.0, "GPU frame render completed successfully!")
+        return {
+            "path": output_path,
+            "filename": os.path.basename(output_path),
+            "size_bytes": file_size,
+            "size_formatted": size_str,
+            "duration": actual_duration,
+            "duration_formatted": format_seconds_to_time(actual_duration),
+            "image_count": len(aligned_images),
+            "resolution": f"{width}x{height}",
+            "fps": fps,
         }
 
     def export_csv_cue_sheet(self, aligned_images: List[Dict[str, Any]], export_path: str):

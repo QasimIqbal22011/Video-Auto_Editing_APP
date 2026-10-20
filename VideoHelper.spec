@@ -8,9 +8,18 @@ BASE_DIR = os.path.abspath(SPECPATH)
 # Data files to bundle inside the executable
 datas = [
     (os.path.join(BASE_DIR, 'src', 'gui', 'web'), os.path.join('src', 'gui', 'web')),
+    (os.path.join(BASE_DIR, 'THIRD_PARTY_NOTICES.md'), '.'),
     (os.path.join(BASE_DIR, 'resources', 'ffmpeg-full', 'bin', 'ffmpeg.exe'), os.path.join('resources', 'ffmpeg-full', 'bin')),
     (os.path.join(BASE_DIR, 'resources', 'ffmpeg', 'ffmpeg.exe'), os.path.join('resources', 'ffmpeg')),
 ]
+
+# Built first by build_exe.py. Keeping the renderer as a separate native
+# process lets the Python UI retain its existing, tested FFmpeg fallback.
+rust_renderer = os.path.join(
+    BASE_DIR, 'rust_renderer', 'target', 'release', 'video_helper_renderer.exe'
+)
+if os.path.isfile(rust_renderer):
+    datas.append((rust_renderer, os.path.join('resources', 'renderer')))
 
 hiddenimports = [
     'clr_loader',

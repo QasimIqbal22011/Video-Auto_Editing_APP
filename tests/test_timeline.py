@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import subprocess
 
 # Ensure project root is in sys.path
@@ -74,6 +75,7 @@ def run_tests():
     img1 = os.path.join(test_dir, "00_00_red.png")
     img2 = os.path.join(test_dir, "00_02_blue.png")
     test_audio = os.path.join(test_dir, "test_audio.wav")
+    long_test_audio = os.path.join(test_dir, "long_test_audio.m4a")
     test_video = os.path.join(test_dir, "aligned_output.mp4")
 
     # Generate 2 solid color images
@@ -93,20 +95,34 @@ def run_tests():
         test_audio
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # A small compressed silent track lets the long-image regression exercise
+    # the complete 12:25.88 timestamp range without creating a huge WAV fixture.
+    subprocess.run([
+        ffmpeg_bin, "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        "-t", "745.88", "-c:a", "aac", "-b:a", "64k", long_test_audio
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     aligned_imgs = aligner.align_images([img1, img2], audio_duration=4.0)
     print("Aligned images:", aligned_imgs)
 
+    progress_values = []
+
     def on_prog(pct, msg):
+        progress_values.append(pct)
         print(f"[{pct:.1f}%] {msg}")
 
     result = aligner.render_video(
         aligned_images=aligned_imgs,
         audio_path=test_audio,
         output_path=test_video,
-        width=1280,
-        height=720,
-        fps=30,
+        width=1920,
+        height=1080,
+        fps=60,
         use_hardware_accel=True,
+        zoom_type="zoom_in",
+        zoom_amount=0.12,
+        transition_type="fade",
+        transition_duration=0.5,
         progress_callback=on_prog
     )
 
@@ -114,30 +130,168 @@ def run_tests():
     print("Output:", result)
     assert os.path.exists(test_video)
     assert result['size_bytes'] > 1000
+    assert result['resolution'] == '1920x1080'
+    assert result['fps'] == 60
+    assert any(pct > 10 for pct in progress_values), progress_values
+    stream_probe = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-i", test_video],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "Audio:" in stream_probe.stderr, stream_probe.stderr
+    audio_sample = subprocess.run(
+        [
+            ffmpeg_bin, "-v", "error", "-ss", "1.0", "-i", test_video,
+            "-map", "0:a:0", "-t", "0.5", "-f", "s16le",
+            "-acodec", "pcm_s16le", "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert audio_sample and any(audio_sample), "Rendered audio track contains no audible samples"
     print("\nTIMELINE ALIGNER UNIT TESTS PASSED!")
 
-    # Regression: a few hundred per-image filters and xfade stages used to be
-    # passed as one oversized Windows command-line argument. The filters now
-    # travel in a script file and image paths use short temporary aliases.
-    many_image_video = os.path.join(test_dir, "many_image_output.mp4")
-    many_images = [dict(aligned_imgs[index % 2], duration=0.04) for index in range(280)]
-    many_result = aligner.render_video(
-        aligned_images=many_images,
-        audio_path=test_audio,
-        output_path=many_image_video,
-        width=160,
-        height=90,
-        fps=5,
-        use_hardware_accel=False,
-        zoom_type="zoom_in",
-        zoom_amount=0.12,
-        transition_type="fade",
-        transition_duration=0.04
-    )
-    assert os.path.exists(many_image_video)
-    assert many_result['image_count'] == 280
-    assert many_result['size_bytes'] > 1000
-    print(f"280-image render regression passed ({many_result['duration']:.2f}s output).")
+    # Regression: render all 280 ordered images across the real 12:25.88
+    # voiceover duration. The GPU backend must stream bounded batches while
+    # maintaining timestamp intervals, transitions, zoom and audio duration.
+    # The old filtergraph fallback is covered by the small test above; skip
+    # this full-duration case when explicitly forcing that legacy path.
+    if aligner._rust_renderer_path():
+        for transition in ("fade", "dissolve", "wipeleft", "slideright", "circleopen", "fadeblack"):
+            transition_output = os.path.join(test_dir, f"transition_{transition}.mp4")
+            transition_result = aligner.render_video(
+                aligned_images=aligned_imgs,
+                audio_path=test_audio,
+                output_path=transition_output,
+                width=160,
+                height=90,
+                fps=6,
+                use_hardware_accel=False,
+                zoom_type="zoom_out",
+                zoom_amount=0.12,
+                transition_type=transition,
+                transition_duration=0.5
+            )
+            assert transition_result['duration'] >= 3.9, (transition, transition_result)
+        print("All six GPU transition shader paths passed.")
+
+        many_image_video = os.path.join(test_dir, "many_image_output.mp4")
+        long_duration = 745.88
+        interval = long_duration / 280
+        unique_image_dir = os.path.join(test_dir, "many_unique_images")
+        os.makedirs(unique_image_dir, exist_ok=True)
+        unique_image_paths = []
+        for index in range(280):
+            source_image = img1 if index % 2 == 0 else img2
+            unique_path = os.path.join(unique_image_dir, f"still_{index:03d}.png")
+            if not os.path.exists(unique_path):
+                try:
+                    os.link(source_image, unique_path)
+                except OSError:
+                    shutil.copyfile(source_image, unique_path)
+            unique_image_paths.append(unique_path)
+        many_images = []
+        for index in range(280):
+            start = index * interval
+            end = long_duration if index == 279 else (index + 1) * interval
+            many_images.append({
+                **aligned_imgs[index % 2],
+                'path': unique_image_paths[index],
+                'filename': os.path.basename(unique_image_paths[index]),
+                'start_sec': start,
+                'end_sec': end,
+                'duration': end - start,
+            })
+        many_result = aligner.render_video(
+            aligned_images=many_images,
+            audio_path=long_test_audio,
+            output_path=many_image_video,
+            width=160,
+            height=90,
+            fps=6,
+            use_hardware_accel=True,
+            zoom_type="zoom_in",
+            zoom_amount=0.12,
+            transition_type="fade",
+            transition_duration=0.04
+        )
+        assert os.path.exists(many_image_video)
+        assert many_result['image_count'] == 280
+        assert many_result['size_bytes'] > 1000
+        assert abs(many_result['duration'] - long_duration) < 0.5, (
+            many_result['duration'], long_duration
+        )
+
+        def sample_rgb(time_sec):
+            sampled = subprocess.run(
+                [
+                    ffmpeg_bin, "-v", "error", "-ss", f"{time_sec:.3f}",
+                    "-i", many_image_video, "-frames:v", "1",
+                    "-vf", "scale=1:1:flags=area,format=rgb24",
+                    "-f", "rawvideo", "pipe:1"
+                ],
+                check=True,
+                capture_output=True
+            ).stdout
+            assert len(sampled) == 3, f"Could not sample output frame at {time_sec:.3f}s"
+            return tuple(sampled)
+
+        for image_index in (0, 1, 278, 279):
+            rgb = sample_rgb(image_index * interval + 0.5)
+            if image_index % 2 == 0:
+                assert rgb[0] > rgb[2] * 2, (image_index, rgb)
+            else:
+                assert rgb[2] > rgb[0] * 2, (image_index, rgb)
+        print(f"280-image timestamp/order regression passed ({many_result['duration']:.2f}s output).")
+
+        # Long hardware gate is opt-in because it encodes 44,000+ frames. Use
+        # VIDEOHELPER_TEST_FULL_1080P_DIRECT=1 when validating the real export
+        # route or collecting a throughput benchmark on the target GPU.
+        if os.environ.get("VIDEOHELPER_TEST_FULL_1080P_DIRECT") == "1":
+            import time
+
+            hd_output = os.path.join(test_dir, "many_image_1080p60_output.mp4")
+            started = time.perf_counter()
+            hd_result = aligner.render_video(
+                aligned_images=many_images,
+                audio_path=long_test_audio,
+                output_path=hd_output,
+                width=1920,
+                height=1080,
+                fps=60,
+                use_hardware_accel=True,
+                zoom_type="zoom_in",
+                zoom_amount=0.12,
+                transition_type="fade",
+                transition_duration=0.5,
+            )
+            elapsed = time.perf_counter() - started
+            assert hd_result['resolution'] == '1920x1080'
+            assert hd_result['fps'] == 60
+            assert abs(hd_result['duration'] - long_duration) < 0.5, hd_result
+            print(
+                f"1080p60 D3D12/NVENC full render passed in {elapsed:.1f}s "
+                f"({long_duration / elapsed:.2f}x real time)."
+            )
+            for image_index in (0, 1, 278, 279):
+                rgb = subprocess.run(
+                    [
+                        ffmpeg_bin, "-v", "error", "-ss", f"{image_index * interval + 0.5:.3f}",
+                        "-i", hd_output, "-frames:v", "1",
+                        "-vf", "scale=1:1:flags=area,format=rgb24",
+                        "-f", "rawvideo", "pipe:1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                assert len(rgb) == 3
+                if image_index % 2 == 0:
+                    assert rgb[0] > rgb[2] * 2, (image_index, tuple(rgb))
+                else:
+                    assert rgb[2] > rgb[0] * 2, (image_index, tuple(rgb))
+    else:
+        print("280-image render regression skipped: Rust/WGPU renderer is disabled or not built.")
 
 if __name__ == '__main__':
     run_tests()
