@@ -1765,5 +1765,26 @@ body { background: radial-gradient(circle at 65% -15%, rgba(45, 63, 132, 0.23), 
 .shared-audio-player.audio-playing .play-glyph { display: none; }
 .shared-audio-player.audio-playing .pause-glyph { display: block; }
 
+/* The dashboard skin is dark-first; reintroduce the persisted light theme
+   after the skin so the toggle changes the actual palette, not just its label. */
+[data-theme="light"] {
+  --bg-app: #eef2f8; --bg-sidebar: #ffffff; --bg-surface: #ffffff;
+  --bg-card: #ffffff; --bg-card-hover: #f5f7fc; --bg-input: #f7f9fd;
+  --border-color: #d8e0ef; --border-focus: #6542df; --border-highlight: rgba(101, 66, 223, .55);
+  --text-main: #15203a; --text-muted: #52617d; --text-dim: #8190aa;
+  --primary-solid: #6542df; --accent-cyan: #008eaa; --accent-emerald: #008f72;
+  --shadow-sm: 0 5px 18px rgba(31, 47, 84, .1); --shadow-md: 0 14px 35px rgba(31, 47, 84, .14);
+}
+[data-theme="light"] body { background: linear-gradient(135deg, #f6f8fc 0%, #e9eef8 100%); }
+[data-theme="light"] .sidebar { background: #ffffff; border-right-color: #d9e1ef; }
+[data-theme="light"] .card, [data-theme="light"] .stat-card { background: #ffffff; border-color: #d8e0ef; }
+[data-theme="light"] .form-select, [data-theme="light"] .form-input { background: #f7f9fd; border-color: #cbd6e8; }
+[data-theme="light"] .timeline-card { background: #f5f8fd; border-color: #b9c9e4; }
+[data-theme="light"] .reference-audio-player { background: #f5f8fd; border-color: #cbd6e8; }
+[data-theme="light"] .audio-time, [data-theme="light"] .audio-volume-button, [data-theme="light"] .audio-more-button { color: #52617d; }
+[data-theme="light"] .theme-toggle-btn { background: #f1f4fa; border-color: #cbd6e8; color: #6542df; }
+[data-theme="light"] .nav-item:hover:not(.disabled) { background: #f1f4fa; }
+[data-theme="light"] .nav-item.active { background: rgba(101, 66, 223, .1); }
+
 
 
