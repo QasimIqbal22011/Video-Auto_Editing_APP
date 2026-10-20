@@ -4,6 +4,7 @@ import re
 import subprocess
 import shutil
 import tempfile
+from functools import lru_cache
 from typing import Optional, Dict, Any, List, Callable
 
 def get_ffmpeg_path() -> str:
@@ -74,11 +75,31 @@ def get_audio_info(file_path: str) -> Dict[str, Any]:
             'size_formatted': str
         }
     """
-    if not os.path.exists(file_path):
+    if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    resolved_path = os.path.realpath(file_path)
+    stat = os.stat(resolved_path)
     ffmpeg_bin = get_ffmpeg_path()
-    file_size = os.path.getsize(file_path)
+    cached = _get_audio_info_cached(
+        resolved_path,
+        stat.st_size,
+        stat.st_mtime_ns,
+        ffmpeg_bin
+    )
+    # Do not expose the cached mapping to callers that might mutate it.
+    return cached.copy()
+
+
+@lru_cache(maxsize=256)
+def _get_audio_info_cached(
+    file_path: str,
+    file_size: int,
+    modified_ns: int,
+    ffmpeg_bin: str
+) -> Dict[str, Any]:
+    """Probe metadata once per file version; stat changes automatically miss the cache."""
+    del modified_ns  # Included in the cache key to invalidate on file changes.
 
     # Format file size
     if file_size < 1024 * 1024:

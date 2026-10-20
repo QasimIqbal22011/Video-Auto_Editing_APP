@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import subprocess
+import tempfile
 import threading
 from typing import List, Dict, Any, Optional, Callable
 from .ffmpeg_utils import get_ffmpeg_path, get_audio_info
@@ -16,6 +17,9 @@ class AudioStitcher:
     - Multi-format support (MP3, WAV, AAC, M4A, FLAC, OGG)
     - Live progress tracking and graceful cancellation
     """
+
+    # Keep both the Windows process command line and FFmpeg filtergraph bounded.
+    _MAX_INPUTS_PER_BATCH = 24
 
     def __init__(self):
         self._current_process: Optional[subprocess.Popen] = None
@@ -102,122 +106,152 @@ class AudioStitcher:
             total_expected_duration = 1.0
 
         ffmpeg_bin = get_ffmpeg_path()
-
-        # Build FFmpeg command with complex_filter
-        cmd = [ffmpeg_bin, "-y", "-hide_banner"]
-
-        # Add all inputs
-        for fp in file_paths:
-            cmd.extend(["-i", fp])
-
-        # Build filtergraph
-        # We resample all inputs to target sample_rate and stereo fltp for seamless concatenation
-        filter_parts = []
-        concat_inputs = []
-        n_elements = 0
-
-        for i in range(len(file_paths)):
-            # Normalize format for input i
-            norm_label = f"in{i}"
-            filter_parts.append(
-                f"[{i}:a]aresample={sample_rate},aformat=sample_fmts=fltp:channel_layouts=stereo[{norm_label}]"
-            )
-            concat_inputs.append(f"[{norm_label}]")
-            n_elements += 1
-
-            # If gap > 0 and not the last clip, insert silence segment
-            if gap_sec > 0.001 and i < len(file_paths) - 1:
-                silence_label = f"gap{i}"
-                filter_parts.append(
-                    f"anullsrc=r={sample_rate}:cl=stereo,atrim=0:{gap_sec:.3f}[{silence_label}]"
-                )
-                concat_inputs.append(f"[{silence_label}]")
-                n_elements += 1
-
-        # Concat filter
-        concat_filter = "".join(concat_inputs) + f"concat=n={n_elements}:v=0:a=1"
-
-        if normalize_audio:
-            # YouTube standard loudness normalization: Integrated -16 LUFS, True Peak -1.5 dB, LRA 11
-            concat_filter += ",loudnorm=I=-16:TP=-1.5:LRA=11"
-
-        filter_parts.append(concat_filter + "[outa]")
-        full_filtergraph = ";".join(filter_parts)
-
-        cmd.extend(["-filter_complex", full_filtergraph, "-map", "[outa]"])
-
-        # Format-specific encoding options
         out_fmt = output_format.lower().replace('.', '')
-        if out_fmt == "mp3":
-            cmd.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k"])
-        elif out_fmt == "wav":
-            cmd.extend(["-c:a", "pcm_s16le"])
-        elif out_fmt in ("m4a", "aac"):
-            cmd.extend(["-c:a", "aac", "-b:a", f"{bitrate_kbps}k"])
-        elif out_fmt == "flac":
-            cmd.extend(["-c:a", "flac"])
-        else:
-            # Default to mp3
-            cmd.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k"])
 
-        cmd.extend(["-ar", str(sample_rate)])
-        cmd.append(output_path)
+        def add_encoder_options(command: list[str]) -> None:
+            if out_fmt == "mp3":
+                command.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k"])
+            elif out_fmt == "wav":
+                command.extend(["-c:a", "pcm_s16le"])
+            elif out_fmt in ("m4a", "aac"):
+                command.extend(["-c:a", "aac", "-b:a", f"{bitrate_kbps}k"])
+            elif out_fmt == "flac":
+                command.extend(["-c:a", "flac"])
+            else:
+                command.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k"])
+            command.extend(["-ar", str(sample_rate), output_path])
+
+        def run_ffmpeg(command: list[str], progress_start: float, progress_span: float,
+                       duration_offset: float, status_prefix: str) -> None:
+            if self._is_cancelled:
+                raise InterruptedError("Stitching cancelled by user.")
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    startupinfo=startupinfo,
+                    bufsize=1
+                )
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 206:
+                    raise RuntimeError(
+                        "Windows rejected the FFmpeg command as too long. "
+                        "Try a shorter output path or fewer clips per batch."
+                    ) from exc
+                raise
+
+            with self._lock:
+                self._current_process = proc
+            try:
+                time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+                for line in proc.stderr:
+                    if self._is_cancelled:
+                        proc.terminate()
+                        raise InterruptedError("Stitching cancelled by user.")
+                    match = time_regex.search(line)
+                    if match and progress_callback:
+                        hours, minutes = int(match.group(1)), int(match.group(2))
+                        current_time = hours * 3600 + minutes * 60 + float(match.group(3))
+                        overall_time = min(total_expected_duration, duration_offset + current_time)
+                        progress_pct = progress_start + (overall_time / total_expected_duration) * progress_span
+                        progress_callback(
+                            round(min(96.0, progress_pct), 1),
+                            f"{status_prefix} ({overall_time:.1f}s / {total_expected_duration:.1f}s)"
+                        )
+                proc.wait()
+                if proc.returncode != 0 and not self._is_cancelled:
+                    raise RuntimeError(f"FFmpeg stitching failed with exit code {proc.returncode}")
+            finally:
+                with self._lock:
+                    self._current_process = None
 
         if progress_callback:
-            progress_callback(15.0, "Starting audio concatenation & mastering...")
+            progress_callback(5.0, "Preparing bounded audio batches...")
 
-        # Setup Windows process flags
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 0
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            startupinfo=startupinfo,
-            bufsize=1
-        )
-
-        with self._lock:
-            self._current_process = proc
-
-        # Read stderr line-by-line to extract time=... progress
-        time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
-
-        try:
-            for line in proc.stderr:
-                if self._is_cancelled:
-                    proc.terminate()
-                    raise InterruptedError("Stitching cancelled by user.")
-
-                match = time_regex.search(line)
-                if match:
-                    hours = int(match.group(1))
-                    minutes = int(match.group(2))
-                    seconds = float(match.group(3))
-                    current_time = hours * 3600 + minutes * 60 + seconds
-                    progress_pct = 15.0 + (current_time / total_expected_duration) * 80.0
-                    progress_pct = max(15.0, min(96.0, progress_pct))
-                    
-                    if progress_callback:
-                        progress_callback(
-                            round(progress_pct, 1),
-                            f"Stitching & mastering... ({current_time:.1f}s / {total_expected_duration:.1f}s)"
+        # A single FFmpeg invocation with hundreds of inputs exceeds Windows'
+        # CreateProcess command-line limit. Render short PCM batches, then join
+        # those batch files in one final pass. Gaps are emitted at each original
+        # clip boundary, and loudness normalization/encoding still happen once.
+        with tempfile.TemporaryDirectory(prefix="vhstitch_") as temp_dir:
+            batch_paths = []
+            chunks = [
+                file_paths[offset:offset + self._MAX_INPUTS_PER_BATCH]
+                for offset in range(0, len(file_paths), self._MAX_INPUTS_PER_BATCH)
+            ]
+            processed_duration = 0.0
+            for batch_index, chunk in enumerate(chunks):
+                chunk_start = batch_index * self._MAX_INPUTS_PER_BATCH
+                filters, labels = [], []
+                element_count = 0
+                chunk_duration = 0.0
+                for local_index, fp in enumerate(chunk):
+                    global_index = chunk_start + local_index
+                    label = f"in{local_index}"
+                    filters.append(
+                        f"[{local_index}:a]aresample={sample_rate},"
+                        f"aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]"
+                    )
+                    labels.append(f"[{label}]")
+                    element_count += 1
+                    chunk_duration += clip_infos[global_index]['duration']
+                    if gap_sec > 0.001 and global_index < len(file_paths) - 1:
+                        gap_label = f"gap{local_index}"
+                        filters.append(
+                            f"anullsrc=r={sample_rate}:cl=stereo,"
+                            f"atrim=0:{gap_sec:.3f}[{gap_label}]"
                         )
+                        labels.append(f"[{gap_label}]")
+                        element_count += 1
+                        chunk_duration += gap_sec
+                filters.append(
+                    "".join(labels) + f"concat=n={element_count}:v=0:a=1[outa]"
+                )
+                batch_path = os.path.join(temp_dir, f"batch_{batch_index:04d}.wav")
+                batch_paths.append(batch_path)
+                command = [ffmpeg_bin, "-y", "-hide_banner"]
+                for fp in chunk:
+                    command.extend(["-i", fp])
+                command.extend([
+                    "-filter_complex", ";".join(filters), "-map", "[outa]",
+                    "-c:a", "pcm_s16le", "-ar", str(sample_rate), "-ac", "2", batch_path
+                ])
+                if progress_callback:
+                    progress_callback(
+                        15.0 + (processed_duration / total_expected_duration) * 45.0,
+                        f"Preparing audio batch {batch_index + 1} of {len(chunks)}..."
+                    )
+                run_ffmpeg(
+                    command, 15.0, 45.0, processed_duration,
+                    f"Preparing audio batch {batch_index + 1} of {len(chunks)}..."
+                )
+                processed_duration += chunk_duration
 
-            proc.wait()
-            if proc.returncode != 0 and not self._is_cancelled:
-                raise RuntimeError(f"FFmpeg stitching failed with exit code {proc.returncode}")
+            manifest_path = os.path.join(temp_dir, "batches.ffconcat")
+            with open(manifest_path, "w", encoding="utf-8", newline="\n") as manifest:
+                manifest.write("ffconcat version 1.0\n")
+                for batch_path in batch_paths:
+                    manifest.write(f"file '{os.path.basename(batch_path)}'\n")
 
-        finally:
-            with self._lock:
-                self._current_process = None
+            final_filter = "-af" if normalize_audio else None
+            command = [
+                ffmpeg_bin, "-y", "-hide_banner", "-f", "concat", "-safe", "0",
+                "-i", manifest_path, "-map", "0:a:0"
+            ]
+            if final_filter:
+                command.extend([final_filter, "loudnorm=I=-16:TP=-1.5:LRA=11"])
+            add_encoder_options(command)
+            if progress_callback:
+                progress_callback(60.0, "Joining batches and mastering final audio...")
+            run_ffmpeg(command, 60.0, 36.0, 0.0, "Final audio mastering...")
 
         if self._is_cancelled:
             if os.path.exists(output_path):

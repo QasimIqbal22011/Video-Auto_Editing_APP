@@ -3,6 +3,7 @@ import sys
 import re
 import subprocess
 import threading
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, Callable, Tuple
 from .ffmpeg_utils import get_ffmpeg_path, get_audio_info
 from .logger import log_info, log_error
@@ -18,6 +19,9 @@ class AudioSilenceRemover:
         self._current_process: Optional[subprocess.Popen] = None
         self._is_cancelled = False
         self._lock = threading.Lock()
+        self._analysis_cache_lock = threading.Lock()
+        self._analysis_cache: OrderedDict[tuple[str, int, int, float, float], tuple[list[Dict[str, Any]], float]] = OrderedDict()
+        self._analysis_cache_limit = 8
 
     def cancel(self):
         """Cancels an ongoing silence detection or removal job."""
@@ -46,6 +50,30 @@ class AudioSilenceRemover:
         self._is_cancelled = False
         threshold_db = float(threshold_db)
         min_duration_sec = max(0.01, float(min_duration_sec))
+        resolved_path = os.path.realpath(file_path)
+        file_stat = os.stat(resolved_path)
+        cache_key = (
+            os.path.normcase(resolved_path),
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            threshold_db,
+            min_duration_sec,
+        )
+        with self._analysis_cache_lock:
+            cached = self._analysis_cache.get(cache_key)
+            if cached is not None:
+                self._analysis_cache.move_to_end(cache_key)
+                cached_intervals, cached_duration = cached
+                intervals_copy = [dict(interval) for interval in cached_intervals]
+            else:
+                intervals_copy = None
+                cached_duration = 0.0
+        if intervals_copy is not None:
+            if progress_callback:
+                progress_callback(10.0, "Using cached silence analysis...")
+                progress_callback(45.0, f"Reused silence analysis for {cached_duration:.1f}s of audio.")
+            return intervals_copy, cached_duration
+
         info = get_audio_info(file_path)
         total_duration = info['duration']
 
@@ -131,6 +159,8 @@ class AudioSilenceRemover:
                     pending_start = None
 
             proc.wait()
+            if proc.returncode != 0 and not self._is_cancelled:
+                raise RuntimeError(f"FFmpeg silence detection failed with exit code {proc.returncode}")
         finally:
             with self._lock:
                 self._current_process = None
@@ -146,6 +176,15 @@ class AudioSilenceRemover:
                 'end_formatted': f"{int(total_duration // 60):02d}:{total_duration % 60:05.2f}",
                 'duration_formatted': f"{dur_val:.2f}s"
             })
+
+        with self._analysis_cache_lock:
+            self._analysis_cache[cache_key] = (
+                [dict(interval) for interval in silence_intervals],
+                total_duration,
+            )
+            self._analysis_cache.move_to_end(cache_key)
+            while len(self._analysis_cache) > self._analysis_cache_limit:
+                self._analysis_cache.popitem(last=False)
 
         return silence_intervals, total_duration
 

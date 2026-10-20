@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import logging
+from logging.handlers import RotatingFileHandler
 import traceback
 from datetime import datetime
 
@@ -48,16 +49,23 @@ def setup_logger():
     logger = logging.getLogger("VideoHelper")
     logger.setLevel(logging.DEBUG)
 
-    # File Handler
+    # Keep diagnostics useful without allowing the log to grow without bound.
     try:
-        fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-        fh.setLevel(logging.DEBUG)
-        formatter = logging.Formatter(
-            '[%(asctime)s] [%(levelname)s] [%(threadName)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+        if not any(handler.get_name() == "video_helper_rotating_file" for handler in logger.handlers):
+            fh = RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=4 * 1024 * 1024,
+                backupCount=3,
+                encoding='utf-8'
+            )
+            fh.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(
+                '[%(asctime)s] [%(levelname)s] [%(threadName)s] %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            fh.setFormatter(formatter)
+            fh.set_name("video_helper_rotating_file")
+            logger.addHandler(fh)
     except Exception as e:
         print(f"Could not initialize FileHandler for {LOG_FILE}: {e}")
 

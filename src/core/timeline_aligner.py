@@ -1,7 +1,9 @@
 import os
 import sys
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 from typing import List, Dict, Any, Optional, Callable, Tuple
 from .ffmpeg_utils import get_ffmpeg_path, get_audio_info
@@ -18,7 +20,7 @@ def format_seconds_to_time(sec: float) -> str:
         return f"{hrs:02d}:{mins:02d}:{secs:05.2f}"
     return f"{mins:02d}:{secs:05.2f}"
 
-def parse_timestamp_from_filename(filename: str) -> Optional[float]:
+def parse_timestamp_from_filename(filename: str, three_part_as_hms: bool = False) -> Optional[float]:
     """
     Extracts timestamp cues in seconds from image filenames.
     Supports formats like:
@@ -73,6 +75,12 @@ def parse_timestamp_from_filename(filename: str) -> Optional[float]:
         p1 = int(m_3part.group(1))
         p2 = int(m_3part.group(2))
         p3_str = m_3part.group(3)
+        if three_part_as_hms and len(p3_str) == 2 and int(p3_str) < 60:
+            # In timestamped image sequences, a three-part cue may be
+            # HH_MM_SS (e.g. image-2_00_00_04 = 4 seconds). Keep the legacy
+            # MM_SS_fraction interpretation available for ambiguous names;
+            # align_images selects between the two using the audio duration.
+            return p1 * 3600.0 + p2 * 60.0 + int(p3_str)
         frac = float("0." + p3_str)
         if has_image_prefix or p1 == 0 or len(p3_str) == 3:
             return p1 * 60.0 + p2 + frac
@@ -139,12 +147,39 @@ class TimelineAligner:
         for idx, img_path in enumerate(image_paths):
             filename = os.path.basename(img_path)
             ts = parse_timestamp_from_filename(filename)
+            try:
+                image_stat = os.stat(img_path)
+                thumbnail_version = f"{image_stat.st_size:x}-{image_stat.st_mtime_ns:x}"
+            except OSError:
+                thumbnail_version = ""
             parsed_items.append({
                 'path': img_path,
                 'filename': filename,
                 'parsed_timestamp': ts,
+                'thumbnail_version': thumbnail_version,
                 'original_index': idx
             })
+
+        # Three numeric groups are ambiguous: e.g. 00_00_04 can mean either
+        # 4 seconds (HH_MM_SS) or 0.04 seconds (MM_SS_fraction). Infer the
+        # intended convention from the complete sequence and voiceover length.
+        timestamped_items = [item for item in parsed_items if item['parsed_timestamp'] is not None]
+        hms_items = []
+        for item in parsed_items:
+            hms_timestamp = parse_timestamp_from_filename(item['filename'], three_part_as_hms=True)
+            if hms_timestamp is not None:
+                hms_items.append((item, hms_timestamp))
+        if len(hms_items) >= max(3, int(len(timestamped_items) * 0.7)) and audio_duration > 0:
+            legacy_max = max(item['parsed_timestamp'] for item in timestamped_items)
+            hms_max = max(timestamp for _, timestamp in hms_items)
+            end_tolerance = max(2.0, audio_duration * 0.02)
+            if (
+                legacy_max < audio_duration * 0.25
+                and hms_max > legacy_max * 3
+                and hms_max <= audio_duration + end_tolerance
+            ):
+                for item, hms_timestamp in hms_items:
+                    item['parsed_timestamp'] = hms_timestamp
 
         # Separate items with explicit timestamps and items without
         with_ts = [it for it in parsed_items if it['parsed_timestamp'] is not None]
@@ -175,6 +210,7 @@ class TimelineAligner:
                 'index': i,
                 'path': item['path'],
                 'filename': item['filename'],
+                'thumbnail_version': item['thumbnail_version'],
                 'start_sec': start_sec,
                 'end_sec': 0.0,
                 'duration': 0.0
@@ -232,6 +268,8 @@ class TimelineAligner:
             raise ValueError("No images provided for timeline alignment.")
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_path = os.path.abspath(audio_path)
+        output_path = os.path.abspath(output_path)
 
         width, height, fps = int(width), int(height), int(fps)
         if width <= 0 or height <= 0 or fps <= 0:
@@ -252,10 +290,36 @@ class TimelineAligner:
         if progress_callback:
             progress_callback(5.0, "Preparing timeline video manifest...")
 
+        render_temp_dir = None
         try:
             ffmpeg_bin = get_ffmpeg_path()
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)
+
+            # Keep FFmpeg's Windows command line short for large image sets.
+            # Place aliases alongside the first source when possible so
+            # same-volume hard links avoid copying large source images.
+            first_image_dir = os.path.dirname(os.path.abspath(aligned_images[0]['path']))
+            try:
+                render_temp_dir = tempfile.TemporaryDirectory(prefix="vh_render_", dir=first_image_dir)
+            except OSError:
+                render_temp_dir = tempfile.TemporaryDirectory(prefix="vh_render_")
+            render_work_dir = render_temp_dir.name
+            staged_image_names = []
+            for index, item in enumerate(aligned_images):
+                source_path = os.path.abspath(item['path'])
+                extension = os.path.splitext(source_path)[1].lower()
+                if extension not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                    extension = ".img"
+                staged_name = f"img_{index:04d}{extension}"
+                staged_path = os.path.join(render_work_dir, staged_name)
+                try:
+                    os.link(source_path, staged_path)
+                except OSError:
+                    # This is only needed for cross-volume, network, or
+                    # filesystems that do not support hard links.
+                    shutil.copyfile(source_path, staged_path)
+                staged_image_names.append(staged_name)
 
             # Use Vulkan only for the image crop/resize/zoom stage. Keep the
             # proven CPU xfade graph for transitions and retry the whole render
@@ -273,16 +337,16 @@ class TimelineAligner:
             if use_gpu_zoom:
                 cmd.extend(["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"])
             durations = []
-            for item in aligned_images:
+            for item, staged_name in zip(aligned_images, staged_image_names):
                 duration = max(0.04, float(item['duration']))
                 durations.append(duration)
                 # Match the still-image input cadence to zoompan/output FPS.
                 # Leaving image2 at its 25 FPS default causes duplicated frames
                 # when rendering at 24/30/60 FPS, which appears as camera shake.
                 if use_gpu_zoom:
-                    cmd.extend(["-framerate", str(fps), "-i", item['path']])
+                    cmd.extend(["-framerate", str(fps), "-i", staged_name])
                 else:
-                    cmd.extend(["-loop", "1", "-framerate", str(fps), "-t", f"{duration:.4f}", "-i", item['path']])
+                    cmd.extend(["-loop", "1", "-framerate", str(fps), "-t", f"{duration:.4f}", "-i", staged_name])
             audio_input_index = len(aligned_images)
             cmd.extend(["-i", audio_path])
 
@@ -401,7 +465,12 @@ class TimelineAligner:
                         f"trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
                     )
 
-            cmd.extend(["-filter_complex", ";".join(filter_parts), "-map", "[vout]", "-map", f"{audio_input_index}:a"])
+            filter_script_path = os.path.join(render_work_dir, "render_filtergraph.txt")
+            with open(filter_script_path, "w", encoding="utf-8", newline="\n") as filter_script:
+                filter_script.write(";".join(filter_parts))
+            # FFmpeg 9 removed -filter_complex_script; the current bundled
+            # build reads option values from files with the `-/option` form.
+            cmd.extend(["-/filter_complex", filter_script_path, "-map", "[vout]", "-map", f"{audio_input_index}:a"])
 
             # Choose video encoder: test NVENC if requested
             if use_hardware_accel:
@@ -416,7 +485,10 @@ class TimelineAligner:
                 output_path
             ])
 
-            log_info(f"[TimelineAligner] Executing FFmpeg video render: {' '.join(cmd)}")
+            log_info(
+                f"[TimelineAligner] Executing FFmpeg video render for {len(aligned_images)} images; "
+                f"filtergraph stored in script ({os.path.getsize(filter_script_path)} bytes)."
+            )
 
             startupinfo = None
             if sys.platform == "win32":
@@ -432,15 +504,20 @@ class TimelineAligner:
                 encoding='utf-8',
                 errors='replace',
                 startupinfo=startupinfo,
-                bufsize=1
+                bufsize=1,
+                cwd=render_work_dir
             )
 
             with self._lock:
                 self._current_process = proc
 
             time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+            ffmpeg_stderr_tail = []
 
             for line in proc.stderr:
+                ffmpeg_stderr_tail.append(line.rstrip())
+                if len(ffmpeg_stderr_tail) > 40:
+                    ffmpeg_stderr_tail.pop(0)
                 if self._is_cancelled:
                     proc.terminate()
                     raise InterruptedError("Video rendering cancelled by user.")
@@ -478,11 +555,17 @@ class TimelineAligner:
                 )
 
             if proc.returncode != 0 and not self._is_cancelled:
-                raise RuntimeError(f"FFmpeg video render failed with exit code {proc.returncode}")
+                details = "\n".join(ffmpeg_stderr_tail[-12:])
+                raise RuntimeError(
+                    f"FFmpeg video render failed with exit code {proc.returncode}."
+                    + (f"\nFFmpeg details:\n{details}" if details else "")
+                )
 
         finally:
             with self._lock:
                 self._current_process = None
+            if render_temp_dir is not None:
+                render_temp_dir.cleanup()
 
         if self._is_cancelled:
             if os.path.exists(output_path):

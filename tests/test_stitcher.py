@@ -53,8 +53,33 @@ def main():
     print(f"Size: {res['size_formatted']}")
     print(f"Path: {res['path']}")
 
+    # Regression: hundreds of inputs previously created a Windows command line
+    # longer than CreateProcess permits. Repeating one tiny source keeps this
+    # integration test fast while still exercising all 312 input slots.
+    short_clip = os.path.join(test_dir, "short_clip.wav")
+    many_clip_output = os.path.join(test_dir, "many_clip_output.wav")
+    subprocess.run(
+        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.05", short_clip],
+        check=True,
+        capture_output=True
+    )
+    many_result = stitcher.stitch(
+        file_paths=[short_clip] * 312,
+        output_path=many_clip_output,
+        gap_sec=0.01,
+        normalize_audio=False,
+        sample_rate=48000,
+        output_format="wav",
+        progress_callback=progress
+    )
+    expected_duration = (312 * 0.05) + (311 * 0.01)
+    assert abs(many_result['duration'] - expected_duration) < 0.25, (
+        many_result['duration'], expected_duration
+    )
+    print(f"312-clip batching regression passed ({many_result['duration']:.2f}s output).")
+
     # Clean up test files
-    for f in [t1, t2, out_master]:
+    for f in [t1, t2, out_master, short_clip, many_clip_output]:
         if os.path.exists(f):
             try:
                 os.remove(f)

@@ -27,6 +27,21 @@ def run_tests():
     assert parse_timestamp_from_filename("image-2_01_03_26.png") == 63.26
     print("Timestamp parsing tests passed!")
 
+    print("\nTesting ambiguous HH_MM_SS timestamp inference...")
+    # These mirror the real image archive convention. The legacy single-name
+    # parser remains compatible, while a full audio timeline selects HH_MM_SS.
+    assert parse_timestamp_from_filename("image-2_00_00_04.jpg") == 0.04
+    timed_images = [
+        "image-1_00_00_00.jpg",
+        "image-2_00_00_04.jpg",
+        "image-3_00_00_08.jpg",
+        "image-280_00_12_23.jpg"
+    ]
+    timestamped_alignment = TimelineAligner().align_images(timed_images, 745.88)
+    assert [item['start_sec'] for item in timestamped_alignment] == [0.0, 4.0, 8.0, 743.0]
+    assert timestamped_alignment[-1]['end_sec'] == 745.88
+    print("HH_MM_SS timestamp inference passed!")
+
     print("\nTesting alignment calculations...")
     aligner = TimelineAligner()
     images = [
@@ -100,6 +115,29 @@ def run_tests():
     assert os.path.exists(test_video)
     assert result['size_bytes'] > 1000
     print("\nTIMELINE ALIGNER UNIT TESTS PASSED!")
+
+    # Regression: a few hundred per-image filters and xfade stages used to be
+    # passed as one oversized Windows command-line argument. The filters now
+    # travel in a script file and image paths use short temporary aliases.
+    many_image_video = os.path.join(test_dir, "many_image_output.mp4")
+    many_images = [dict(aligned_imgs[index % 2], duration=0.04) for index in range(280)]
+    many_result = aligner.render_video(
+        aligned_images=many_images,
+        audio_path=test_audio,
+        output_path=many_image_video,
+        width=160,
+        height=90,
+        fps=5,
+        use_hardware_accel=False,
+        zoom_type="zoom_in",
+        zoom_amount=0.12,
+        transition_type="fade",
+        transition_duration=0.04
+    )
+    assert os.path.exists(many_image_video)
+    assert many_result['image_count'] == 280
+    assert many_result['size_bytes'] > 1000
+    print(f"280-image render regression passed ({many_result['duration']:.2f}s output).")
 
 if __name__ == '__main__':
     run_tests()

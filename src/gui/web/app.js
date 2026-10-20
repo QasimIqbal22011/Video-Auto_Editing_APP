@@ -4,6 +4,7 @@ let audioClips = [];
 let currentPlayingPath = null;
 let activeAudioObj = null;
 let lastStitchedResult = null;
+let lastStitchNormalizationApplied = false;
 
 // DOM Elements
 const docRoot = document.documentElement;
@@ -334,7 +335,20 @@ function setupEventListeners() {
     htmlAudioInput.addEventListener('change', async (e) => {
       const files = e.target.files;
       if (files && files.length > 0) {
-        await uploadFilesToServer(files);
+        const directPaths = Array.from(files).map(file => file.path).filter(Boolean);
+        let importedDirectly = false;
+        if (directPaths.length === files.length && window.pywebview && window.pywebview.api) {
+          try {
+            const metadata = await window.pywebview.api.inspect_dropped_files(directPaths);
+            if (metadata.length === files.length && metadata.every(item => !item.error)) {
+              appendClips(metadata);
+              importedDirectly = true;
+            }
+          } catch (err) {
+            console.warn("Direct audio inspection failed; using batched upload:", err);
+          }
+        }
+        if (!importedDirectly) await uploadFilesToServer(files);
         htmlAudioInput.value = ''; // Reset so the same file can be selected again
       }
     });
@@ -389,11 +403,13 @@ function setupEventListeners() {
       }
     }
 
-    if (paths.length > 0 && window.pywebview && window.pywebview.api) {
+    if (paths.length === files.length && window.pywebview && window.pywebview.api) {
       try {
         const metadataList = await window.pywebview.api.inspect_dropped_files(paths);
-        appendClips(metadataList);
-        return;
+        if (metadataList.length === files.length && metadataList.every(item => !item.error)) {
+          appendClips(metadataList);
+          return;
+        }
       } catch (err) {
         console.warn("inspect_dropped_files failed, falling back to upload:", err);
       }
@@ -424,7 +440,10 @@ function setupEventListeners() {
   if (sendToSilenceBtn) {
     sendToSilenceBtn.addEventListener('click', () => {
       if (!lastStitchedResult) return;
-      setSilenceActiveFile(lastStitchedResult);
+      setSilenceActiveFile({
+        ...lastStitchedResult,
+        normalization_applied: lastStitchNormalizationApplied
+      });
       switchTab('silence');
       successCard.style.display = 'none';
       if (masterAudioPlayer) {
@@ -461,42 +480,83 @@ async function openAddFilesDialog() {
   }
 }
 
-async function uploadFilesToServer(files) {
-  const formData = new FormData();
-  let validCount = 0;
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    formData.append('audio_files', f, f.name);
-    validCount++;
+const MAX_MULTIPART_BATCH_BYTES = 48 * 1024 * 1024;
+
+function splitFilesBySize(fileList, maxBytes = MAX_MULTIPART_BATCH_BYTES) {
+  const batches = [];
+  let batch = [];
+  let batchBytes = 0;
+  for (const file of Array.from(fileList || [])) {
+    const fileBytes = Number(file.size) || 0;
+    if (batch.length && batchBytes + fileBytes > maxBytes) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    batch.push(file);
+    batchBytes += fileBytes;
+    // Isolate a single oversized file; Bottle will spool it after its memory threshold.
+    if (batchBytes >= maxBytes) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
   }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
 
-  if (validCount === 0) return;
-
-  const prevText = dropzone.querySelector('h3').textContent;
-  dropzone.querySelector('h3').textContent = `Importing ${validCount} audio file(s)...`;
-
-  try {
-    const response = await fetch('/upload_audio', {
-      method: 'POST',
-      body: formData
-    });
-    const text = await response.text();
-    let data;
+async function uploadInBatches(files, endpoint, fieldName, resultKey, onProgress) {
+  const batches = splitFilesBySize(files);
+  const imported = [];
+  let completedFiles = 0;
+  for (const batch of batches) {
     try {
-      data = JSON.parse(text);
-    } catch (parseErr) {
-      throw new Error(`Server status ${response.status}: ${text.slice(0, 150)}`);
+      const formData = new FormData();
+      batch.forEach(file => formData.append(fieldName, file, file.name));
+      const response = await fetch(endpoint, { method: 'POST', body: formData });
+      const rawText = await response.text();
+      let data;
+      try {
+        data = JSON.parse(rawText);
+      } catch (_) {
+        throw new Error(`Server status ${response.status}: ${rawText.slice(0, 150)}`);
+      }
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Upload failed with status ${response.status}`);
+      }
+      imported.push(...(data[resultKey] || []));
+      completedFiles += batch.length;
+      if (onProgress) onProgress(completedFiles, files.length);
+    } catch (error) {
+      return { items: imported, error, completedFiles };
     }
-    if (data.success && data.clips && data.clips.length > 0) {
-      appendClips(data.clips);
-    } else if (data.error) {
-      alert("Error importing files: " + data.error);
-    }
+  }
+  return { items: imported, error: null, completedFiles };
+}
+
+async function uploadFilesToServer(files) {
+  const validCount = files ? files.length : 0;
+  if (validCount === 0) return;
+  const importProgress = document.getElementById('audioImportProgress');
+  const importText = document.getElementById('audioImportProgressText');
+  const importBar = document.getElementById('audioImportProgressBar');
+  importProgress.hidden = false;
+  importText.textContent = `Importing ${validCount} audio file(s)...`;
+  importBar.value = 0;
+  try {
+    const result = await uploadInBatches(files, '/upload_audio', 'audio_files', 'clips', (done, total) => {
+      importText.textContent = `Imported ${done} of ${total} audio files...`;
+      importBar.value = total ? (done / total) * 100 : 100;
+    });
+    if (result.items.length) appendClips(result.items);
+    if (result.error) throw result.error;
   } catch (err) {
     console.error("Upload error:", err);
     alert("Could not import audio files:\n" + err.message);
   } finally {
-    dropzone.querySelector('h3').textContent = prevText;
+    importProgress.hidden = true;
+    importBar.value = 0;
   }
 }
 
@@ -513,16 +573,16 @@ function renderClips() {
   if (audioClips.length === 0) {
     dropzone.style.display = 'block';
     clipsList.style.display = 'none';
-    clipsList.innerHTML = '';
+    clipsList.replaceChildren();
   } else {
     dropzone.style.display = 'none';
     clipsList.style.display = 'flex';
-    clipsList.innerHTML = '';
-
+    const fragment = document.createDocumentFragment();
     audioClips.forEach((clip, index) => {
       const card = createClipCard(clip, index);
-      clipsList.appendChild(card);
+      fragment.appendChild(card);
     });
+    clipsList.replaceChildren(fragment);
   }
 
   updateStats();
@@ -745,6 +805,7 @@ async function executeStitch() {
   const filePaths = audioClips.map(c => c.path);
   const gapSec = parseFloat(gapSlider.value) || 0.0;
   const normalize = normalizeCheckbox.checked;
+  lastStitchNormalizationApplied = normalize;
   const format = getSelectedFormat();
   const sampleRate = parseInt(sampleRateSelect.value, 10) || 48000;
   const bitrate = 320;
@@ -782,7 +843,10 @@ window.onStitchProgress = function(percent, statusMsg) {
 
 window.onStitchComplete = function(result) {
   resetProgress();
-  lastStitchedResult = result;
+  lastStitchedResult = {
+    ...result,
+    normalization_applied: lastStitchNormalizationApplied
+  };
 
   // Show success card
   successCard.style.display = 'block';
@@ -1148,6 +1212,9 @@ async function handleSilenceFiles(files) {
 
 function setSilenceActiveFile(clip) {
   silenceActiveFile = clip;
+  // If this audio was mastered by Stitcher, avoid running loudnorm again by
+  // default. Users can still re-enable it explicitly in this workflow.
+  silenceNormalize.checked = clip.normalization_applied === true ? false : true;
 
   silenceFileName.textContent = clip.filename;
   silenceFileFmt.textContent = clip.format_name.toUpperCase();
@@ -1398,6 +1465,15 @@ function initTimelineAligner() {
 function setupTimelineEventListeners() {
   if (!timelineAudioDropzone) return;
 
+  document.getElementById('timelineQuickDraftBtn').addEventListener('click', () => {
+    const draftResolution = document.querySelector('input[name="videoRes"][value="720p"]');
+    if (draftResolution) {
+      draftResolution.checked = true;
+      draftResolution.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    document.querySelector('#timelineView .chip[data-fps="24"]')?.click();
+  });
+
   // Audio slot triggers
   timelineAudioDropzone.addEventListener('click', () => timelineAudioInput.click());
   changeTimelineAudioBtn.addEventListener('click', () => timelineAudioInput.click());
@@ -1618,15 +1694,11 @@ function setTimelineActiveAudio(audioMeta) {
 }
 
 async function handleTimelineImagesUpload(files) {
-  const directPaths = [];
-  for (let i = 0; i < files.length; i++) {
-    if (files[i].path) directPaths.push(files[i].path);
-  }
-
-  if (directPaths.length > 0 && window.pywebview && window.pywebview.api) {
+  const directPaths = Array.from(files || []).map(file => file.path).filter(Boolean);
+  if (directPaths.length === files.length && window.pywebview && window.pywebview.api) {
     try {
       const inspected = await window.pywebview.api.inspect_dropped_images(directPaths);
-      if (inspected && inspected.length > 0) {
+      if (inspected && inspected.length === files.length) {
         appendTimelineImages(inspected);
         return;
       }
@@ -1635,30 +1707,33 @@ async function handleTimelineImagesUpload(files) {
     }
   }
 
-  // Upload images to local server
-  const formData = new FormData();
-  for (let i = 0; i < files.length; i++) {
-    formData.append('image_files', files[i], files[i].name);
-  }
-
+  const importStatus = document.getElementById('timelineImageImportStatus');
+  const importText = document.getElementById('timelineImageImportText');
+  const importBar = document.getElementById('timelineImageImportBar');
+  importStatus.hidden = false;
+  importText.textContent = `Importing ${files.length} images...`;
+  importBar.value = 0;
   try {
-    const res = await fetch('/upload_images', { method: 'POST', body: formData });
-    const data = await res.json();
-    if (data.success && data.images && data.images.length > 0) {
-      appendTimelineImages(data.images);
-    } else {
-      alert("Error importing images: " + (data.error || "Unknown"));
-    }
+    const result = await uploadInBatches(files, '/upload_images', 'image_files', 'images', (done, total) => {
+      importText.textContent = `Imported ${done} of ${total} images...`;
+      importBar.value = total ? (done / total) * 100 : 100;
+    });
+    if (result.items.length) appendTimelineImages(result.items);
+    if (result.error) throw result.error;
   } catch (err) {
     alert("Failed to upload images: " + err.message);
+  } finally {
+    importStatus.hidden = true;
+    importBar.value = 0;
   }
 }
 
 function appendTimelineImages(newImages) {
+  const existingPaths = new Set(timelineImagesList.map(existing => existing.path));
   newImages.forEach(img => {
-    // Avoid exact duplicate file paths
-    if (!timelineImagesList.some(existing => existing.path === img.path)) {
+    if (!existingPaths.has(img.path)) {
       timelineImagesList.push(img);
+      existingPaths.add(img.path);
     }
   });
   recalculateTimelineAlignment();
@@ -1708,6 +1783,7 @@ function fallbackClientAlignment() {
       index: idx,
       path: img.path,
       filename: img.filename,
+      thumbnail_version: img.thumbnail_version || `${img.size_bytes || 0}`,
       start_sec: start,
       end_sec: end,
       duration: dur,
@@ -1722,7 +1798,7 @@ function renderTimelineCards() {
   if (alignedTimelineItems.length === 0) {
     timelineImagesDropzone.style.display = 'block';
     timelineSequenceContainer.style.display = 'none';
-    timelineCardsGrid.innerHTML = '';
+    timelineCardsGrid.replaceChildren();
     statTimelineImgCount.textContent = '0';
     statTimelineCoverage.textContent = '0%';
     startRenderVideoBtn.disabled = true;
@@ -1731,14 +1807,14 @@ function renderTimelineCards() {
 
   timelineImagesDropzone.style.display = 'none';
   timelineSequenceContainer.style.display = 'block';
-  timelineCardsGrid.innerHTML = '';
+  const fragment = document.createDocumentFragment();
 
   alignedTimelineItems.forEach((item, idx) => {
     const card = document.createElement('div');
     card.className = 'timeline-card';
     card.innerHTML = `
       <div class="timeline-card-thumb-box">
-        <img class="timeline-card-thumb" src="/stream_image?path=${encodeURIComponent(item.path)}" alt="${item.filename}" loading="lazy">
+        <img class="timeline-card-thumb" src="/thumbnail_image?path=${encodeURIComponent(item.path)}&width=360&v=${encodeURIComponent(item.thumbnail_version || '')}" alt="${item.filename}" loading="lazy" decoding="async">
         <span class="timeline-card-seq-badge">#${idx + 1}</span>
         <button class="timeline-card-del-btn" title="Remove image" data-index="${idx}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
@@ -1762,8 +1838,9 @@ function renderTimelineCards() {
       recalculateTimelineAlignment();
     });
 
-    timelineCardsGrid.appendChild(card);
+    fragment.appendChild(card);
   });
+  timelineCardsGrid.replaceChildren(fragment);
 
   statTimelineImgCount.textContent = alignedTimelineItems.length;
   statTimelineCoverage.textContent = timelineActiveAudio ? '100%' : 'No Audio';
@@ -1898,6 +1975,15 @@ function initZoomTransitions() {
   const zoomMainColumn = document.querySelector('#zoomView .timeline-main-column');
   if (zoomMainColumn && zoomSuccessCard) zoomMainColumn.appendChild(zoomSuccessCard);
 
+  document.getElementById('zoomQuickDraftBtn').addEventListener('click', () => {
+    const draftResolution = document.querySelector('input[name="zoomVideoRes"][value="720p"]');
+    if (draftResolution) {
+      draftResolution.checked = true;
+      draftResolution.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    document.querySelector('#zoomView .chip[data-zoom-fps="24"]')?.click();
+  });
+
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
   const zoomAudioPlayBtn = document.getElementById('zoomAudioPlayBtn');
   const zoomAudioSeek = document.getElementById('zoomAudioSeek');
@@ -2007,13 +2093,14 @@ function setZoomActiveMedia(audioMeta, alignedItems) {
 
 function renderZoomCards() {
   const grid = document.getElementById('zoomCardsGrid');
-  grid.innerHTML = '';
+  const fragment = document.createDocumentFragment();
   zoomAlignedItems.forEach((item, index) => {
     const card = document.createElement('div');
     card.className = 'timeline-card';
-    card.innerHTML = `<div class="timeline-card-thumb-box"><img class="timeline-card-thumb" src="/stream_image?path=${encodeURIComponent(item.path)}" alt="${item.filename}" loading="lazy"><span class="timeline-card-seq-badge">#${index + 1}</span></div><div class="timeline-card-body"><div class="timeline-card-title" title="${item.filename}">${item.filename}</div><div class="timeline-card-timing"><span class="timeline-pill-time">${item.start_formatted} ➔ ${item.end_formatted}</span><span class="timeline-pill-dur">${item.duration_formatted}</span></div></div>`;
-    grid.appendChild(card);
+    card.innerHTML = `<div class="timeline-card-thumb-box"><img class="timeline-card-thumb" src="/thumbnail_image?path=${encodeURIComponent(item.path)}&width=360&v=${encodeURIComponent(item.thumbnail_version || '')}" alt="${item.filename}" loading="lazy" decoding="async"><span class="timeline-card-seq-badge">#${index + 1}</span></div><div class="timeline-card-body"><div class="timeline-card-title" title="${item.filename}">${item.filename}</div><div class="timeline-card-timing"><span class="timeline-pill-time">${item.start_formatted} ➔ ${item.end_formatted}</span><span class="timeline-pill-dur">${item.duration_formatted}</span></div></div>`;
+    fragment.appendChild(card);
   });
+  grid.replaceChildren(fragment);
 }
 
 async function executeZoomRender() {
