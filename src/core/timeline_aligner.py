@@ -361,22 +361,41 @@ class TimelineAligner:
                         for label in video_labels:
                             filter_parts.append(f"[{label}]hwdownload,format=yuv420p[dl{label}]")
                         video_labels = [f"dl{label}" for label in video_labels]
+                    # xfade consumes part of its first input during the
+                    # transition. Hold each non-final clip's last frame for
+                    # that duration so the transition starts at the real
+                    # timestamp instead of moving the next image earlier.
+                    padded_labels = []
+                    for idx, label in enumerate(video_labels):
+                        if idx < len(video_labels) - 1:
+                            padded = f"pad{label}"
+                            filter_parts.append(
+                                f"[{label}]format=yuv420p,tpad=stop_mode=clone:"
+                                f"stop_duration={effective_transition:.4f}[{padded}]"
+                            )
+                            padded_labels.append(padded)
+                        else:
+                            padded_labels.append(label)
+                    video_labels = padded_labels
                     current = video_labels[0]
                     elapsed = durations[0]
                     for idx in range(1, len(video_labels)):
                         output = f"xf{idx}"
-                        offset = max(0.0, elapsed - effective_transition)
+                        # Keep the transition boundary at the actual image
+                        # timestamp. Subtracting the transition duration here
+                        # makes every following image appear early.
+                        offset = elapsed
                         filter_parts.append(
                             f"[{current}][{video_labels[idx]}]xfade=transition={transition_type}"
                             f":duration={effective_transition:.4f}:offset={offset:.4f}[{output}]"
                         )
                         current = output
-                        elapsed += durations[idx] - effective_transition
+                        elapsed += durations[idx]
                     # xfade overlaps adjacent clips, so restore the lost overlap
                     # by holding the final frame. This keeps the rendered video
                     # exactly as long as the synchronized voiceover.
-                    transition_loss = effective_transition * (len(video_labels) - 1)
-                    pad_duration = max(0.0, total_audio_dur - (sum(durations) - transition_loss))
+                    transition_loss = 0.0
+                    pad_duration = max(0.0, total_audio_dur - sum(durations))
                     filter_parts.append(
                         f"[{current}]format=yuv420p,tpad=stop_mode=clone:stop_duration={pad_duration:.4f},"
                         f"trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
