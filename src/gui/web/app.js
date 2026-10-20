@@ -72,6 +72,65 @@ window.onunhandledrejection = function(event) {
   sendClientLog('error', 'Unhandled Promise Rejection: ' + reason);
 };
 
+// Shared reference-style audio preview used by every workflow engine.
+function initSharedAudioPreviews() {
+  const audioIds = ['masterAudioPlayer', 'silenceOriginalPlayer', 'silenceCleanPlayer', 'timelineAudioPlayer'];
+  const bars = [18, 27, 38, 24, 48, 33, 58, 42, 66, 36, 54, 72, 44, 61, 35, 52, 70, 43, 29, 47, 63, 35, 55, 74, 42, 31, 57, 68, 46, 60, 35, 51, 72, 38, 26, 48, 65, 42, 58, 31, 49, 67, 39, 55, 72, 44, 29, 50, 64];
+  const formatTime = seconds => {
+    if (!Number.isFinite(seconds)) return '00:00';
+    return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+  };
+
+  audioIds.forEach(audioId => {
+    const audio = document.getElementById(audioId);
+    if (!audio || audio.closest('.reference-audio-player')) return;
+    audio.controls = false;
+    audio.classList.add('shared-audio-native');
+    const player = document.createElement('div');
+    player.className = 'reference-audio-player shared-audio-player';
+    player.innerHTML = `
+      <div class="audio-waveform" aria-hidden="true">${bars.map(height => `<span style="height:${height}%"></span>`).join('')}</div>
+      <div class="audio-transport-row">
+        <button class="audio-play-button" type="button" aria-label="Play audio">
+          <svg class="play-glyph" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.2v13.6c0 .8.9 1.3 1.6.9l10.2-6.8c.6-.4.6-1.3 0-1.7L9.6 4.3C8.9 3.9 8 4.4 8 5.2z"/></svg>
+          <svg class="pause-glyph" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3v14H7zM14 5h3v14h-3z"/></svg>
+        </button>
+        <span class="audio-time audio-current">00:00</span>
+        <input type="range" class="audio-seek" min="0" max="100" value="0" aria-label="Audio playback position">
+        <span class="audio-time audio-duration">00:00</span>
+        <button class="audio-volume-button" type="button" aria-label="Toggle mute">⌁</button>
+        <button class="audio-more-button" type="button" aria-label="Audio options">⋮</button>
+      </div>`;
+    audio.parentNode.insertBefore(player, audio);
+    player.appendChild(audio);
+    const play = player.querySelector('.audio-play-button');
+    const seek = player.querySelector('.audio-seek');
+    const current = player.querySelector('.audio-current');
+    const duration = player.querySelector('.audio-duration');
+    const volume = player.querySelector('.audio-volume-button');
+    const sync = () => {
+      const total = audio.duration || 0;
+      const percent = total ? (audio.currentTime / total) * 100 : 0;
+      seek.value = percent;
+      seek.style.setProperty('--seek-progress', `${percent}%`);
+      current.textContent = formatTime(audio.currentTime);
+      duration.textContent = formatTime(total);
+      player.classList.toggle('audio-playing', !audio.paused);
+    };
+    play.addEventListener('click', () => audio.paused ? audio.play() : audio.pause());
+    seek.addEventListener('input', () => {
+      if (audio.duration) audio.currentTime = (parseFloat(seek.value) / 100) * audio.duration;
+      sync();
+    });
+    volume.addEventListener('click', () => {
+      audio.muted = !audio.muted;
+      volume.classList.toggle('muted', audio.muted);
+    });
+    ['loadedmetadata', 'timeupdate', 'play', 'pause', 'ended'].forEach(eventName => audio.addEventListener(eventName, sync));
+    sync();
+  });
+}
+
 // =============================================================================
 // 1. THEME MANAGEMENT
 // =============================================================================
@@ -97,6 +156,7 @@ function applyTheme(theme) {
 // =============================================================================
 window.addEventListener('DOMContentLoaded', () => {
   initTheme();
+  initSharedAudioPreviews();
   initSettings();
   setupEventListeners();
   initSilenceRemover();
@@ -1548,7 +1608,7 @@ function setTimelineActiveAudio(audioMeta) {
   timelineAudioPlayer.src = `/stream_audio?path=${encodeURIComponent(audioMeta.path)}&t=${Date.now()}`;
 
   timelineAudioDropzone.style.display = 'none';
-  timelineActiveAudioBar.style.display = 'flex';
+  timelineActiveAudioBar.style.display = 'block';
   changeTimelineAudioBtn.style.display = 'inline-block';
 
   statTimelineAudioDur.textContent = audioMeta.duration_formatted;
@@ -1925,7 +1985,7 @@ function setZoomActiveMedia(audioMeta, alignedItems) {
   zoomActiveAudio = audioMeta;
   zoomAlignedItems = alignedItems.map(item => ({ ...item }));
   document.getElementById('zoomSourceEmpty').style.display = 'none';
-  document.getElementById('zoomSourceActive').style.display = 'flex';
+  document.getElementById('zoomSourceActive').style.display = 'block';
   document.getElementById('zoomAudioName').textContent = audioMeta.filename;
   document.getElementById('zoomAudioMeta').textContent = `${audioMeta.duration_formatted} · ${audioMeta.format_name}`;
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
