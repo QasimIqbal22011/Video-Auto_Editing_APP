@@ -1895,6 +1895,8 @@ function initZoomTransitions() {
   zoomSuccessCard = document.getElementById('zoomSuccessCard');
   zoomSuccessDetails = document.getElementById('zoomSuccessDetails');
   zoomVideoPlayer = document.getElementById('zoomVideoPlayer');
+  const zoomMainColumn = document.querySelector('#zoomView .timeline-main-column');
+  if (zoomMainColumn && zoomSuccessCard) zoomMainColumn.appendChild(zoomSuccessCard);
 
   const zoomAudioPlayer = document.getElementById('zoomAudioPlayer');
   const zoomAudioPlayBtn = document.getElementById('zoomAudioPlayBtn');

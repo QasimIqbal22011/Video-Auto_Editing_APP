@@ -189,7 +189,21 @@ class ApiBridge:
         nvenc_ready = False
         if ffmpeg_bin:
             try:
-                probe = subprocess.run([ffmpeg_bin, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=10)
+                startupinfo = None
+                creationflags = 0
+                if sys.platform == "win32":
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                probe = subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", "-encoders"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags
+                )
                 nvenc_ready = "h264_nvenc" in probe.stdout
             except (OSError, subprocess.SubprocessError):
                 pass

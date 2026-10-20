@@ -47,37 +47,55 @@ A modern, standalone desktop application designed to automate tedious editing wo
 
 ## 🚀 How to Run
 
-### Prerequisites
+## Clone and Run
 
-- Python 3.11+
-- FFmpeg available at `resources/ffmpeg/ffmpeg.exe` or on `PATH`
-- WebView2 Runtime on Windows for the native desktop window
+The full FFmpeg binaries are stored with Git LFS. Install Git LFS before cloning so the binaries are downloaded correctly.
 
-Install Python dependencies with:
+### 1. Clone the branch
 
 ```powershell
+git lfs install
+git clone --branch fix/frontend-polish-preview https://github.com/QasimIqbal22011/Video-Auto_Editing_APP.git
+cd Video-Auto_Editing_APP
+git lfs pull
+```
+
+### 2. Prerequisites
+
+- Python 3.11+
+- Git LFS 3+
+- WebView2 Runtime on Windows for the native desktop window
+
+Create the Python environment and install dependencies:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### Option A: Run the Standalone .exe (No Python Required)
-Navigate to the `dist` folder and launch:
-```text
-A:\My Video Helper App_(Clone)\dist\VideoHelper\VideoHelper.exe
-```
+### 3. Run from source
 
-### Option B: Run from Source (Python Dev Mode)
 ```powershell
 python src/main.py
 ```
 
-### Option C: Run Unit Tests
+The app prefers `resources\ffmpeg-full\bin\ffmpeg.exe` automatically.
+
+### 4. Run the packaged executable
+
+```text
+dist\VideoHelper\VideoHelper.exe
+```
+
+### 5. Run tests and rebuild
+
 ```powershell
 python tests/test_stitcher.py
 python tests/test_silence.py
 python tests/test_timeline.py
-```
-
-### Option D: Recompile the .exe
-```powershell
 python build_exe.py
 ```
+
+The rebuilt executable is written to `dist\VideoHelper\VideoHelper.exe`.
