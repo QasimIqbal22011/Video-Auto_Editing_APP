@@ -257,37 +257,17 @@ class TimelineAligner:
             out_dir = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(out_dir, exist_ok=True)
 
-            # The full bundled build provides Vulkan filters. If the machine
-            # has no usable Vulkan device, FFmpeg will fail and the existing
-            # recursive retry below will use the CPU graph automatically.
-            use_gpu_zoom = (
-                use_hardware_accel
-                and "ffmpeg-full" in os.path.normcase(ffmpeg_bin)
-                and zoom_type != "none"
-                and zoom_amount > 0
-            )
-            # xfade_opencl was tested, but this FFmpeg build cannot preserve
-            # its hardware frame context through the padding needed to keep
-            # audio/video duration aligned. Leave it opt-in only after a
-            # future FFmpeg upgrade fixes that boundary.
-            use_gpu_transition = False
-            use_gpu_filters = use_gpu_zoom or use_gpu_transition
-
             # Feed each still as its own timed stream. This allows effects to be
             # applied independently while retaining the alignment durations.
             cmd = [ffmpeg_bin, "-y", "-hide_banner"]
-            if use_gpu_zoom:
-                cmd.extend(["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"])
-            elif use_gpu_transition:
-                cmd.extend(["-init_hw_device", "opencl=ocl", "-filter_hw_device", "ocl"])
             durations = []
             for item in aligned_images:
                 duration = max(0.04, float(item['duration']))
                 durations.append(duration)
-                # Decode each still once. Repeating the decoded frame with the
-                # loop filter below avoids re-decoding a large PNG for every
-                # output frame while preserving the requested input cadence.
-                cmd.extend(["-framerate", str(fps), "-i", item['path']])
+                # Match the still-image input cadence to zoompan/output FPS.
+                # Leaving image2 at its 25 FPS default causes duplicated frames
+                # when rendering at 24/30/60 FPS, which appears as camera shake.
+                cmd.extend(["-loop", "1", "-framerate", str(fps), "-t", f"{duration:.4f}", "-i", item['path']])
             audio_input_index = len(aligned_images)
             cmd.extend(["-i", audio_path])
 
@@ -301,31 +281,15 @@ class TimelineAligner:
                     f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                     f"crop={width}:{height}"
                 )
-                frame_count = max(1, round(duration * fps))
-                repeat = f"loop=loop={frame_count - 1}:size=1,setpts=N/({fps}*TB)"
-                if use_gpu_zoom:
-                    if zoom_type == "zoom_in":
-                        crop_scale = f"(1+{zoom_amount:.6f}*n/{max(1, frame_count - 1)})"
-                    else:
-                        crop_scale = f"(1+{zoom_amount:.6f}*(1-n/{max(1, frame_count - 1)}))"
-                    aspect = width / height
-                    effect = (
-                        f"{repeat},format=yuv420p,hwupload,"
-                        f"libplacebo=w={width}:h={height}:"
-                        f"crop_w='min(iw,ih*{aspect:.8f})/{crop_scale}':"
-                        f"crop_h='min(ih,iw/{aspect:.8f})/{crop_scale}':format=yuv420p"
-                    )
-                elif use_gpu_transition:
-                    effect = f"{base},{repeat},format=yuv420p,hwupload"
-                elif zoom_type == "none" or zoom_amount == 0:
-                    effect = f"{base},{repeat},fps={fps},format=yuv420p"
+                if zoom_type == "none" or zoom_amount == 0:
+                    effect = f"{base},fps={fps},format=yuv420p"
                 else:
                     # Use per-frame perspective mapping instead of zoompan.
                     # zoompan rounds its crop window to integer coordinates,
                     # which produces alternating 1px motion on sharp artwork.
                     # perspective evaluates floating-point corners per frame
                     # with cubic interpolation, giving a stable sub-pixel zoom.
-                    zoom_frames = max(2, frame_count)
+                    zoom_frames = max(2, round(duration * fps))
                     if zoom_type == "zoom_in":
                         z = f"(1+{zoom_amount:.6f}*on/{zoom_frames - 1})"
                     else:
@@ -335,54 +299,31 @@ class TimelineAligner:
                     left, right = f"W/2-{half_w}", f"W/2+{half_w}"
                     top, bottom = f"H/2-{half_h}", f"H/2+{half_h}"
                     effect = (
-                        f"{base},{repeat},fps={fps},"
+                        f"{base},fps={fps},"
                         f"perspective=eval=frame:interpolation=cubic:"
                         f"x0='{left}':y0='{top}':x1='{right}':y1='{top}':"
                         f"x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}',"
                         f"format=yuv420p"
                     )
-                if use_gpu_transition:
-                    filter_parts.append(f"{source}{effect}[{label}]")
-                elif use_gpu_zoom:
-                    filter_parts.append(f"{source}{effect},trim=duration={duration:.4f},setpts=PTS-STARTPTS[{label}]")
-                else:
-                    filter_parts.append(f"{source}{effect},trim=duration={duration:.4f},setpts=PTS-STARTPTS,settb=AVTB[{label}]")
+                filter_parts.append(f"{source}{effect},trim=duration={duration:.4f},setpts=PTS-STARTPTS,settb=AVTB[{label}]")
                 video_labels.append(label)
 
             if transition_type == "hard_cut" or len(video_labels) == 1:
-                if use_gpu_filters:
-                    for label in video_labels:
-                        filter_parts.append(f"[{label}]hwdownload,format=yuv420p[dl{label}]")
-                    video_labels = [f"dl{label}" for label in video_labels]
                 concat_inputs = "".join(f"[{label}]" for label in video_labels)
                 filter_parts.append(f"{concat_inputs}concat=n={len(video_labels)}:v=1:a=0[vout]")
             else:
                 effective_transition = min(transition_duration, min(durations) / 2.0)
                 if effective_transition <= 0:
-                    if use_gpu_filters:
-                        for label in video_labels:
-                            filter_parts.append(f"[{label}]hwdownload,format=yuv420p[dl{label}]")
-                        video_labels = [f"dl{label}" for label in video_labels]
                     concat_inputs = "".join(f"[{label}]" for label in video_labels)
                     filter_parts.append(f"{concat_inputs}concat=n={len(video_labels)}:v=1:a=0[vout]")
                 else:
-                    # Vulkan zoom and OpenCL transitions are separate GPU
-                    # paths. Vulkan/OpenCL interop is not implemented by this
-                    # FFmpeg build, so a zoomed render downloads once and uses
-                    # the proven CPU xfade; transition-only renders stay on
-                    # OpenCL for the crossfade itself.
-                    if use_gpu_zoom:
-                        for label in video_labels:
-                            filter_parts.append(f"[{label}]hwdownload,format=yuv420p[dl{label}]")
-                        video_labels = [f"dl{label}" for label in video_labels]
                     current = video_labels[0]
                     elapsed = durations[0]
                     for idx in range(1, len(video_labels)):
                         output = f"xf{idx}"
                         offset = max(0.0, elapsed - effective_transition)
                         filter_parts.append(
-                            f"[{current}][{video_labels[idx]}]"
-                            f"{'xfade_opencl' if use_gpu_transition else 'xfade'}=transition={transition_type}"
+                            f"[{current}][{video_labels[idx]}]xfade=transition={transition_type}"
                             f":duration={effective_transition:.4f}:offset={offset:.4f}[{output}]"
                         )
                         current = output
@@ -392,28 +333,9 @@ class TimelineAligner:
                     # exactly as long as the synchronized voiceover.
                     transition_loss = effective_transition * (len(video_labels) - 1)
                     pad_duration = max(0.0, total_audio_dur - (sum(durations) - transition_loss))
-                    if use_gpu_transition:
-                        gpu_frames = max(1, round((sum(durations) - transition_loss) * fps))
-                        pad_frames = max(0, round(pad_duration * fps))
-                        if pad_frames:
-                            tail = (
-                                f"hwdownload,format=yuv420p,split=2[xfmain][xftail];"
-                                f"[xfmain]setpts=PTS-STARTPTS[xfmain_pts];"
-                                f"[xftail]trim=start_frame={gpu_frames - 1}:end_frame={gpu_frames},"
-                                f"loop=loop={pad_frames - 1}:size=1,setpts=N/({fps}*TB)[xftail_pad];"
-                                f"[xfmain_pts][xftail_pad]concat=n=2:v=1:a=0,"
-                                f"trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
-                            )
-                        else:
-                            tail = f"hwdownload,format=yuv420p,trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
-                    else:
-                        tail = (
-                            f"format=yuv420p,tpad=stop_mode=clone:stop_duration={pad_duration:.4f},"
-                            f"trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
-                        )
                     filter_parts.append(
-                        f"[{current}]"
-                        f"{tail}"
+                        f"[{current}]format=yuv420p,tpad=stop_mode=clone:stop_duration={pad_duration:.4f},"
+                        f"trim=duration={total_audio_dur:.4f},setpts=PTS-STARTPTS[vout]"
                     )
 
             cmd.extend(["-filter_complex", ";".join(filter_parts), "-map", "[vout]", "-map", f"{audio_input_index}:a"])
