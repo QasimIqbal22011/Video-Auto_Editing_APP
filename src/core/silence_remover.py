@@ -3,9 +3,10 @@ import sys
 import re
 import subprocess
 import threading
+import tempfile
 from collections import OrderedDict
 from typing import List, Dict, Any, Optional, Callable, Tuple
-from .ffmpeg_utils import get_ffmpeg_path, get_audio_info
+from .ffmpeg_utils import get_ffmpeg_path, get_audio_info, get_video_info
 from .logger import log_info, log_error
 
 class AudioSilenceRemover:
@@ -248,6 +249,35 @@ class AudioSilenceRemover:
         final_segments = [(round(s, 3), round(e, 3)) for s, e in merged if (e - s) >= 0.05]
         return final_segments
 
+    def compute_retained_intervals(
+        self,
+        silence_intervals: List[Dict[str, float]],
+        total_duration: float,
+        margin_ms: float = 80.0,
+        frame_rate: Optional[float] = None,
+    ) -> List[Tuple[float, float]]:
+        """Return the exact speech intervals the renderer will retain.
+
+        Video intervals are expanded outward to whole source-frame boundaries,
+        matching the video renderer's frame-safe cut behavior.
+        """
+        retained = self.compute_speech_intervals(silence_intervals, total_duration, margin_ms)
+        if not frame_rate or frame_rate <= 0:
+            return retained
+
+        frame_duration = 1.0 / frame_rate
+        snapped: List[Tuple[float, float]] = []
+        for start, end in retained:
+            frame_start = max(0.0, int(start / frame_duration) * frame_duration)
+            frame_end = min(total_duration, int(end / frame_duration + 0.999999) * frame_duration)
+            if frame_end <= frame_start:
+                continue
+            if snapped and frame_start <= snapped[-1][1] + 0.0005:
+                snapped[-1] = (snapped[-1][0], max(snapped[-1][1], frame_end))
+            else:
+                snapped.append((frame_start, frame_end))
+        return snapped
+
     def remove_silences(
         self,
         file_path: str,
@@ -338,8 +368,16 @@ class AudioSilenceRemover:
 
         filter_parts.append(concat_filter + "[outa]")
         full_filtergraph = ";".join(filter_parts)
+        # Keep long timelines out of the Windows process command line; a
+        # filter script avoids WinError 206 when many pauses produce segments.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".ffscript", prefix="vh_silence_",
+            dir=out_dir, delete=False, newline="\n"
+        ) as filter_script:
+            filter_script.write(full_filtergraph)
+            filter_script_path = filter_script.name
 
-        cmd.extend(["-filter_complex", full_filtergraph, "-map", "[outa]"])
+        cmd.extend(["-/filter_complex", filter_script_path, "-map", "[outa]"])
 
         # Output encoding
         out_fmt = output_format.lower().replace('.', '')
@@ -376,9 +414,13 @@ class AudioSilenceRemover:
             self._current_process = proc
 
         time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+        stderr_tail: List[str] = []
 
         try:
             for line in proc.stderr:
+                stderr_tail.append(line.rstrip())
+                if len(stderr_tail) > 40:
+                    stderr_tail.pop(0)
                 if self._is_cancelled:
                     proc.terminate()
                     raise InterruptedError("Cancelled by user.")
@@ -394,11 +436,18 @@ class AudioSilenceRemover:
 
             proc.wait()
             if proc.returncode != 0 and not self._is_cancelled:
-                raise RuntimeError(f"FFmpeg silence removal failed with exit code {proc.returncode}")
+                raise RuntimeError(
+                    f"FFmpeg silence removal failed with exit code {proc.returncode}:\n"
+                    + "\n".join(stderr_tail[-12:])
+                )
 
         finally:
             with self._lock:
                 self._current_process = None
+            try:
+                os.remove(filter_script_path)
+            except OSError:
+                pass
 
         if self._is_cancelled:
             if os.path.exists(output_path):
@@ -432,5 +481,231 @@ class AudioSilenceRemover:
             'time_saved_sec': round(saved_sec, 2),
             'percent_saved': saved_pct,
             'time_saved_percent': saved_pct,
-            'silence_segments': silences[:100]  # First 100 silence intervals for telemetry UI
+            'silence_segments': silences[:100],  # First 100 silence intervals for telemetry UI
+            'kept_intervals': [[round(start, 6), round(end, 6)] for start, end in speech_segments],
+        }
+
+    def remove_silences_from_video(
+        self,
+        file_path: str,
+        output_path: str,
+        threshold_db: float = -40.0,
+        min_duration_sec: float = 0.4,
+        margin_ms: float = 80.0,
+        normalize_audio: bool = True,
+        use_hardware_accel: bool = True,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """Remove detected silent intervals from both streams of a video.
+
+        Audio and video are trimmed by the same kept-time intervals, snapped
+        outward to the source video's frame grid so visual cuts occur on full
+        frames without sacrificing the speech-safety margin. Returns the kept
+        intervals for retiming any original still-image timeline.
+        """
+        self._is_cancelled = False
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Input video not found: {file_path}")
+        video_info = get_video_info(file_path)
+        total_duration = float(video_info["duration"])
+        fps = float(video_info.get("fps") or 30.0)
+
+        silences, detected_duration = self.detect_silence_intervals(
+            file_path=file_path,
+            threshold_db=threshold_db,
+            min_duration_sec=min_duration_sec,
+            progress_callback=progress_callback,
+        )
+        total_duration = min(total_duration, detected_duration) if detected_duration > 0 else total_duration
+        if self._is_cancelled:
+            raise InterruptedError("Video silence removal cancelled by user.")
+
+        speech_segments = self.compute_retained_intervals(
+            silences, total_duration, margin_ms, frame_rate=fps
+        )
+        if not speech_segments:
+            raise ValueError("All video audio was detected as silence. Adjust the silence settings and try again.")
+
+        # Outward snapping preserves speech and gives matching audio/video
+        # boundaries on the source video's frame grid.
+        kept_intervals = speech_segments
+        if not kept_intervals:
+            raise ValueError("No frame-aligned speech intervals remain after silence analysis.")
+
+        expected_duration = sum(end - start for start, end in kept_intervals)
+        saved_sec = max(0.0, total_duration - expected_duration)
+        saved_pct = round(100.0 * saved_sec / max(0.001, total_duration), 1)
+        if progress_callback:
+            progress_callback(
+                50.0,
+                f"Found {len(silences)} pauses ({saved_sec:.1f}s). Retiming video and audio together...",
+            )
+
+        ffmpeg_bin = get_ffmpeg_path()
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(out_dir, exist_ok=True)
+        audio_output_path = os.path.splitext(output_path)[0] + "_audio.m4a"
+        temp_dir = tempfile.TemporaryDirectory(prefix="vh_silence_video_", dir=out_dir)
+        staged_video = os.path.join(temp_dir.name, "synchronized.mp4")
+        staged_audio = os.path.join(temp_dir.name, "synchronized_audio.m4a")
+        filter_script = os.path.join(temp_dir.name, "trim_timeline.ffscript")
+
+        graph_parts = []
+        concat_labels = []
+        video_inputs = "".join(f"[vsrc{index}]" for index in range(len(kept_intervals)))
+        audio_inputs = "".join(f"[asrc{index}]" for index in range(len(kept_intervals)))
+        graph_parts.append(f"[0:v:0]split={len(kept_intervals)}{video_inputs}")
+        graph_parts.append(f"[0:a:0]asplit={len(kept_intervals)}{audio_inputs}")
+        for index, (start, end) in enumerate(kept_intervals):
+            graph_parts.append(
+                f"[vsrc{index}]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[v{index}]"
+            )
+            graph_parts.append(
+                f"[asrc{index}]atrim=start={start:.6f}:end={end:.6f},"
+                f"asetpts=PTS-STARTPTS,aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+            )
+            concat_labels.append(f"[v{index}][a{index}]")
+        graph_parts.append(
+            "".join(concat_labels)
+            + f"concat=n={len(kept_intervals)}:v=1:a=1[vcat][acat]"
+        )
+        if normalize_audio:
+            graph_parts.append("[acat]loudnorm=I=-16:TP=-1.5:LRA=11[aout]")
+        else:
+            graph_parts.append("[acat]anull[aout]")
+        with open(filter_script, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(";\n".join(graph_parts))
+
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+
+        def run_render(encoder_args: List[str]) -> List[str]:
+            cmd = [
+                ffmpeg_bin, "-y", "-hide_banner", "-i", file_path,
+                "-/filter_complex", filter_script,
+                "-map", "[vcat]", "-map", "[aout]",
+                "-r", f"{fps:.6f}", "-fps_mode", "cfr",
+                *encoder_args,
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                staged_video,
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                startupinfo=startupinfo,
+                bufsize=1,
+            )
+            with self._lock:
+                self._current_process = proc
+            stderr_tail: List[str] = []
+            time_regex = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
+            try:
+                if proc.stderr is not None:
+                    for line in proc.stderr:
+                        stderr_tail.append(line.rstrip())
+                        if len(stderr_tail) > 40:
+                            stderr_tail.pop(0)
+                        if self._is_cancelled:
+                            proc.terminate()
+                            raise InterruptedError("Video silence removal cancelled by user.")
+                        match = time_regex.search(line)
+                        if match and progress_callback:
+                            current = (
+                                int(match.group(1)) * 3600
+                                + int(match.group(2)) * 60
+                                + float(match.group(3))
+                            )
+                            progress_callback(
+                                50.0 + min(45.0, 45.0 * current / max(0.1, expected_duration)),
+                                f"Rendering synchronized video ({current:.1f}s / {expected_duration:.1f}s)...",
+                            )
+                proc.wait()
+            finally:
+                with self._lock:
+                    self._current_process = None
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"FFmpeg synchronized video render failed ({proc.returncode}):\n"
+                    + "\n".join(stderr_tail[-12:])
+                )
+            return stderr_tail
+
+        try:
+            try:
+                if use_hardware_accel:
+                    run_render(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-b:v", "8M"])
+                else:
+                    run_render(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+            except InterruptedError:
+                raise
+            except Exception as hardware_error:
+                if not use_hardware_accel:
+                    raise
+                log_error(f"[SilenceRemover] NVENC video trim failed; retrying with libx264: {hardware_error}")
+                if os.path.exists(staged_video):
+                    os.remove(staged_video)
+                run_render(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+
+            # A compact AAC sidecar lets Zoom & Transitions consume the
+            # silence-trimmed voiceover without extracting/re-uploading it.
+            extract = subprocess.run(
+                [
+                    ffmpeg_bin, "-y", "-hide_banner", "-i", staged_video,
+                    "-map", "0:a:0", "-vn", "-c:a", "copy", staged_audio,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                startupinfo=startupinfo,
+                check=False,
+            )
+            if extract.returncode != 0:
+                raise RuntimeError(f"Could not extract trimmed audio for the Zoom handoff: {extract.stderr[-2000:]}")
+            if self._is_cancelled:
+                raise InterruptedError("Video silence removal cancelled by user.")
+
+            os.replace(staged_audio, audio_output_path)
+            os.replace(staged_video, output_path)
+        finally:
+            if self._is_cancelled:
+                for partial in (staged_video, staged_audio, output_path, audio_output_path):
+                    if os.path.isfile(partial):
+                        try:
+                            os.remove(partial)
+                        except OSError:
+                            pass
+            temp_dir.cleanup()
+
+        final_video = get_video_info(output_path)
+        final_audio = get_audio_info(audio_output_path)
+        actual_saved_sec = max(0.0, total_duration - float(final_video["duration"]))
+        actual_saved_pct = round(100.0 * actual_saved_sec / max(0.001, total_duration), 1)
+        return {
+            "media_type": "video",
+            "path": output_path,
+            "filename": os.path.basename(output_path),
+            "duration": final_video["duration"],
+            "duration_formatted": final_video["duration_formatted"],
+            "size_bytes": final_video["size_bytes"],
+            "size_formatted": final_video["size_formatted"],
+            "format_name": "MP4",
+            "video_info": final_video,
+            "audio_path": audio_output_path,
+            "audio_info": final_audio,
+            "original_duration": total_duration,
+            "trimmed_duration": final_video["duration"],
+            "silence_count": len(silences),
+            "silence_removed_sec": round(actual_saved_sec, 2),
+            "percent_saved": actual_saved_pct,
+            "silence_segments": silences[:100],
+            "kept_intervals": [[round(start, 6), round(end, 6)] for start, end in kept_intervals],
         }

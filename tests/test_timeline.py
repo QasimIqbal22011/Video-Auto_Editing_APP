@@ -66,6 +66,19 @@ def run_tests():
     assert aligned[2]['duration'] == 8.0
     print("Alignment calculations passed!")
 
+    print("\nTesting still-image remapping through removed-silence intervals...")
+    retimed = TimelineAligner.retime_aligned_images(
+        [
+            {'index': 0, 'path': 'a.jpg', 'filename': 'a.jpg', 'start_sec': 0.0, 'end_sec': 2.0, 'duration': 2.0},
+            {'index': 1, 'path': 'b.jpg', 'filename': 'b.jpg', 'start_sec': 2.0, 'end_sec': 4.0, 'duration': 2.0},
+        ],
+        [(0.0, 1.5), (2.5, 4.0)],
+    )
+    assert len(retimed) == 2
+    assert retimed[0]['start_sec'] == 0.0 and retimed[0]['end_sec'] == 1.5
+    assert retimed[1]['start_sec'] == 1.5 and retimed[1]['end_sec'] == 3.0
+    print("Still-image timeline remapping passed!")
+
     # Test rendering short video
     print("\nTesting video rendering with FFmpeg...")
     ffmpeg_bin = get_ffmpeg_path()

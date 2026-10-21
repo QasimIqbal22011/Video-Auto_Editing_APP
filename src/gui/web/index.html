@@ -284,22 +284,13 @@
                 </select>
               </div>
 
-              <!-- Destination File -->
-              <div class="setting-group">
-                <label>Export Destination</label>
-                <div class="destination-picker">
-                  <input type="text" id="outputPathInput" class="form-input" readonly placeholder="Click browse to select output file...">
-                  <button class="btn btn-secondary" id="browseDestBtn">Browse</button>
-                </div>
-              </div>
-
               <!-- Primary Stitch Action -->
               <div class="submit-section">
                 <button class="btn btn-primary btn-stitch" id="startStitchBtn">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polygon points="5 3 19 12 5 21 5 3"></polygon>
                   </svg>
-                  Stitch & Master Audio
+                  Stitch Audio
                 </button>
               </div>
             </div>
@@ -344,13 +335,10 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                   </svg>
-                  Open in Explorer
-                </button>
-                <button class="btn btn-primary btn-sm" id="sendToSilenceBtn">
-                  Send to Silence Remover
+                  Download Audio
                 </button>
                 <button class="btn btn-secondary btn-sm" id="sendStitchToTimelineBtn">
-                  Send to Timeline
+                  Send to Timeline Aligner
                 </button>
                 <button class="btn btn-ghost btn-sm" id="dismissSuccessBtn">Dismiss</button>
               </div>
@@ -386,13 +374,13 @@
         </header>
 
         <!-- Hidden input for file picking -->
-        <input type="file" id="silenceFileInput" accept=".mp3,.wav,.m4a,.aac,.flac,.ogg,.wma" style="display:none">
+        <input type="file" id="silenceFileInput" accept=".mp3,.wav,.m4a,.aac,.flac,.ogg,.wma,.mp4,.mov,.mkv,.webm,.avi" style="display:none">
 
         <!-- Workspace Grid -->
         <div class="workspace-grid">
           <!-- Left: Audio Source & Silence Telemetry -->
           <div class="clips-container">
-            <!-- Dropzone for voiceover input -->
+            <!-- Dropzone for audio or synchronized video input -->
             <div class="dropzone" id="silenceDropzone">
               <div class="dropzone-content">
                 <div class="dropzone-icon-box">
@@ -403,9 +391,9 @@
                     <line x1="8" y1="23" x2="16" y2="23"></line>
                   </svg>
                 </div>
-                <h3>Drop Voiceover Audio Here</h3>
+                <h3>Drop Voiceover Audio or Synchronized MP4 Here</h3>
                 <p>or click to select file from your computer</p>
-                <div class="supported-formats">Supports MP3, WAV, M4A, AAC, FLAC, OGG</div>
+                <div class="supported-formats">Audio: MP3, WAV, M4A, AAC, FLAC, OGG · Video: MP4, MOV, MKV, WebM, AVI</div>
               </div>
             </div>
 
@@ -434,7 +422,14 @@
               <!-- Inline Audio Player for original -->
               <div class="inline-player-wrapper" style="margin-top: 12px;">
                 <audio id="silenceOriginalPlayer" controls class="custom-audio-player"></audio>
+                <video id="silenceOriginalVideoPlayer" controls class="custom-video-player" style="display:none; width:100%; max-height:260px; background:#000; border-radius:var(--radius-md);"></video>
               </div>
+            </div>
+
+            <div class="card timeline-images-wrapper" id="silenceAlignedImagesCard" style="display:none;">
+              <div class="card-title">Aligned Image Sequence <span class="badge active-badge" id="silenceAlignedImagesCount">0 images</span></div>
+              <p class="setting-help">These original still-image timings will be retimed with the cleaned voiceover.</p>
+              <div class="timeline-cards-grid" id="silenceAlignedImagesGrid"></div>
             </div>
 
             <!-- Silence Intervals Telemetry Card (Shown after analysis) -->
@@ -524,7 +519,8 @@
                 </div>
               </div>
 
-              <!-- Output Format & Quality -->
+              <div id="silenceAudioOutputSettings">
+              <!-- Output Format & Quality (audio-only input) -->
               <div class="setting-group">
                 <label>Output Format & Quality</label>
                 <div class="format-select-grid">
@@ -552,13 +548,10 @@
                 </div>
               </div>
 
-              <!-- Destination File -->
-              <div class="setting-group">
-                <label>Export Destination</label>
-                <div class="destination-picker">
-                  <input type="text" id="silenceOutputPathInput" class="form-input" readonly placeholder="Output file path...">
-                  <button class="btn btn-secondary" id="browseSilenceDestBtn">Browse</button>
-                </div>
+              
+              </div>
+              <div id="silenceVideoOutputNote" class="setting-help" style="display:none; margin:10px 0;">
+                The synchronized MP4 stays available inside the app for preview and handoff. Saving it is optional.
               </div>
 
               <!-- Action Buttons -->
@@ -571,7 +564,7 @@
                     <polyline points="3 6 5 6 21 6"></polyline>
                     <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
                   </svg>
-                  Cut Silences
+                  <span id="silenceRemoveButtonLabel">Cut Silences</span>
                 </button>
               </div>
             </div>
@@ -607,6 +600,7 @@
 
               <div class="master-player-box">
                 <audio id="silenceCleanPlayer" controls class="custom-audio-player"></audio>
+                <video id="silenceCleanVideoPlayer" controls class="custom-video-player" style="display:none; width:100%; max-height:360px; background:#000; border-radius:var(--radius-md);"></video>
               </div>
 
               <div class="success-actions">
@@ -619,8 +613,11 @@
                 <button class="btn btn-primary btn-sm" id="sendToStitcherBtn">
                   Send to Stitcher
                 </button>
-                <button class="btn btn-secondary btn-sm" id="sendSilenceToTimelineBtn">
-                  Send to Timeline
+                <button class="btn btn-primary btn-sm" id="sendSilenceVideoToZoomBtn" style="display:none;">
+                  Send to Zoom &amp; Transitions
+                </button>
+                <button class="btn btn-secondary btn-sm" id="saveSilenceVideoBtn" style="display:none;">
+                  Save Synchronized Video
                 </button>
                 <button class="btn btn-ghost btn-sm" id="dismissSilenceSuccessBtn">Dismiss</button>
               </div>
@@ -755,9 +752,6 @@
                       </svg>
                       Export CSV
                     </button>
-                    <button class="btn btn-primary btn-sm" id="sendToZoomBtn" title="Send aligned images and voiceover directly to the final effects render; no draft video render is needed">
-                      Send to Effects (skip draft)
-                    </button>
                     <button class="btn btn-ghost btn-sm" id="clearImagesBtn" title="Remove all images">
                       Clear Images
                     </button>
@@ -841,22 +835,19 @@
                 </div>
               </div>
 
-              <!-- Destination File -->
-              <div class="setting-group">
-                <label>Output Video Destination</label>
-                <div class="destination-picker">
-                  <input type="text" id="timelineOutputPathInput" class="form-input" readonly placeholder="Output video path...">
-                  <button class="btn btn-secondary" id="browseTimelineDestBtn">Browse</button>
-                </div>
-              </div>
-
-              <!-- Submit Button -->
+              <!-- Workflow Actions -->
               <div class="submit-section">
                 <button class="btn btn-primary btn-block" id="startRenderVideoBtn" disabled>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <polygon points="5 3 19 12 5 21 5 3"></polygon>
                   </svg>
                   Render Aligned Video
+                </button>
+                <button class="btn btn-secondary btn-block" id="sendToZoomBtn" disabled>
+                  Send to Zoom &amp; Transitions
+                </button>
+                <button class="btn btn-secondary btn-block" id="sendTimelineAudioToSilenceBtn" disabled>
+                  Send to Silence Remover
                 </button>
               </div>
             </div>
@@ -901,7 +892,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                   </svg>
-                  Open in Explorer
+                  Download Aligned Video
                 </button>
                 <button class="btn btn-ghost btn-sm" id="dismissTimelineSuccessBtn">Dismiss</button>
               </div>

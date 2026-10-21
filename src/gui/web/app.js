@@ -224,6 +224,7 @@ function dismissSplashScreen() {
 }
 
 function suggestDefaultOutputPath() {
+  if (!outputPathInput) return;
   const fmt = getSelectedFormat();
   const timestamp = new Date().toISOString().slice(0, 10);
   const defaultPath = `master_audio_${timestamp}.${fmt}`;
@@ -235,6 +236,30 @@ function suggestDefaultOutputPath() {
 // =============================================================================
 // 3. SETTINGS & PARAMETERS
 // =============================================================================
+
+// Keeps the .active highlight on radio cards in sync with the real checked
+// state. Listens to click as well as change, because clicking an
+// already-selected radio fires neither change nor any restore path — the card
+// could otherwise stay unhighlighted. Syncs once on setup so no handler can
+// leave a group without a visible selection. Scoped to the group's own view
+// panel so it never strips highlights from other engines' radio cards.
+function setupRadioCardGroup(name) {
+  const firstRadio = document.querySelector(`input[name="${name}"]`);
+  if (!firstRadio) return;
+  const panel = firstRadio.closest('.view-panel') || document;
+  const sync = () => {
+    panel.querySelectorAll('.radio-card').forEach(card => {
+      const input = card.querySelector(`input[name="${name}"]`);
+      if (input) card.classList.toggle('active', input.checked);
+    });
+  };
+  panel.querySelectorAll(`input[name="${name}"]`).forEach(radio => {
+    radio.addEventListener('click', sync);
+    radio.addEventListener('change', sync);
+  });
+  sync();
+}
+
 function initSettings() {
   // Gap slider & chips sync
   gapSlider.addEventListener('input', (e) => {
@@ -252,14 +277,13 @@ function initSettings() {
   // Format selection
   formatRadios.forEach(radio => {
     radio.addEventListener('change', () => {
-      document.querySelectorAll('.radio-card').forEach(c => c.classList.remove('active'));
-      radio.closest('.radio-card').classList.add('active');
       updateOutputPathExtension(radio.value);
     });
   });
+  setupRadioCardGroup('outFormat');
 
   // Browse output destination
-  browseDestBtn.addEventListener('click', async () => {
+  if (browseDestBtn) browseDestBtn.addEventListener('click', async () => {
     sendClientLog('info', 'User clicked Browse Destination');
     if (!window.pywebview || !window.pywebview.api) {
       sendClientLog('warn', 'pywebview API not ready yet for browse destination');
@@ -298,6 +322,7 @@ function getSelectedFormat() {
 }
 
 function updateOutputPathExtension(ext) {
+  if (!outputPathInput) return;
   let cur = outputPathInput.value;
   if (cur) {
     const dotIdx = cur.lastIndexOf('.');
@@ -432,25 +457,14 @@ function setupEventListeners() {
   // Success actions
   openFolderBtn.addEventListener('click', async () => {
     if (lastStitchedResult && window.pywebview && window.pywebview.api) {
-      await window.pywebview.api.open_folder(lastStitchedResult.path);
+      const destination = await window.pywebview.api.select_save_destination(
+        lastStitchedResult.filename || 'stitched_master.mp3'
+      );
+      if (!destination) return;
+      const saved = await window.pywebview.api.copy_media_to_destination(lastStitchedResult.path, destination);
+      if (!saved?.success) alert(`Could not download audio: ${saved?.error || 'Unknown error'}`);
     }
   });
-
-  const sendToSilenceBtn = document.getElementById('sendToSilenceBtn');
-  if (sendToSilenceBtn) {
-    sendToSilenceBtn.addEventListener('click', () => {
-      if (!lastStitchedResult) return;
-      setSilenceActiveFile({
-        ...lastStitchedResult,
-        normalization_applied: lastStitchNormalizationApplied
-      });
-      switchTab('silence');
-      successCard.style.display = 'none';
-      if (masterAudioPlayer) {
-        masterAudioPlayer.pause();
-      }
-    });
-  }
 
   const sendStitchToTimelineBtn = document.getElementById('sendStitchToTimelineBtn');
   if (sendStitchToTimelineBtn) {
@@ -794,12 +808,6 @@ async function executeStitch() {
     return;
   }
 
-  let outPath = outputPathInput.value.trim();
-  if (!outPath) {
-    alert("Please specify an export destination file.");
-    return;
-  }
-
   stopPlayback();
 
   const filePaths = audioClips.map(c => c.path);
@@ -819,9 +827,8 @@ async function executeStitch() {
   progressStatusText.textContent = "Initializing stitching pipeline...";
 
   try {
-    await window.pywebview.api.start_stitch(
+    await window.pywebview.api.start_stitch_internal(
       filePaths,
-      outPath,
       gapSec,
       normalize,
       sampleRate,
@@ -903,11 +910,12 @@ function switchTab(tabName) {
 // =============================================================================
 let silenceActiveFile = null;
 let lastSilenceResult = null;
+let silenceAnalysisDebounce = null;
 
 // DOM Elements
 let silenceDropzone, silenceFileInput, silenceAudioCard, silenceFileName;
 let silenceFileFmt, silenceFileDur, silenceFileSr, silenceFileSize;
-let changeSilenceFileBtn, silenceOriginalPlayer;
+let changeSilenceFileBtn, silenceOriginalPlayer, silenceOriginalVideoPlayer;
 let silenceCountStat, silenceSavedStat, silenceNewDurStat;
 let silenceTelemetryCard, silenceBadgeStats, silenceListContainer;
 let thresholdSlider, threshDisplay, threshChips;
@@ -916,8 +924,9 @@ let marginSlider, marginDisplay, marginChips;
 let silenceNormalize, silenceFormatRadios, silenceOutputPathInput, browseSilenceDestBtn;
 let analyzeSilencesBtn, startSilenceRemovalBtn;
 let silenceProgressCard, silenceProgressStatusText, silenceProgressPercent, silenceProgressBarFill, cancelSilenceBtn;
-let silenceSuccessCard, silenceSuccessDetails, silenceCleanPlayer;
+let silenceSuccessCard, silenceSuccessDetails, silenceCleanPlayer, silenceCleanVideoPlayer;
 let openSilenceFolderBtn, sendToStitcherBtn, dismissSilenceSuccessBtn;
+let sendSilenceVideoToZoomBtn, saveSilenceVideoBtn, silenceAudioOutputSettings, silenceVideoOutputNote;
 
 function initSilenceRemover() {
   silenceDropzone = document.getElementById('silenceDropzone');
@@ -930,6 +939,7 @@ function initSilenceRemover() {
   silenceFileSize = document.getElementById('silenceFileSize');
   changeSilenceFileBtn = document.getElementById('changeSilenceFileBtn');
   silenceOriginalPlayer = document.getElementById('silenceOriginalPlayer');
+  silenceOriginalVideoPlayer = document.getElementById('silenceOriginalVideoPlayer');
 
   silenceCountStat = document.getElementById('silenceCountStat');
   silenceSavedStat = document.getElementById('silenceSavedStat');
@@ -968,6 +978,11 @@ function initSilenceRemover() {
   silenceSuccessCard = document.getElementById('silenceSuccessCard');
   silenceSuccessDetails = document.getElementById('silenceSuccessDetails');
   silenceCleanPlayer = document.getElementById('silenceCleanPlayer');
+  silenceCleanVideoPlayer = document.getElementById('silenceCleanVideoPlayer');
+  sendSilenceVideoToZoomBtn = document.getElementById('sendSilenceVideoToZoomBtn');
+  saveSilenceVideoBtn = document.getElementById('saveSilenceVideoBtn');
+  silenceAudioOutputSettings = document.getElementById('silenceAudioOutputSettings');
+  silenceVideoOutputNote = document.getElementById('silenceVideoOutputNote');
   openSilenceFolderBtn = document.getElementById('openSilenceFolderBtn');
   sendToStitcherBtn = document.getElementById('sendToStitcherBtn');
   dismissSilenceSuccessBtn = document.getElementById('dismissSilenceSuccessBtn');
@@ -1019,61 +1034,52 @@ function setupSilenceEventListeners() {
   // Slider controls: Threshold
   thresholdSlider.addEventListener('input', (e) => {
     updateSilenceThresh(parseFloat(e.target.value));
+    scheduleSilenceAnalysis();
   });
   threshChips.forEach(chip => {
     chip.addEventListener('click', () => {
       const val = parseFloat(chip.getAttribute('data-thresh'));
       thresholdSlider.value = val;
       updateSilenceThresh(val);
+      scheduleSilenceAnalysis();
     });
   });
 
   // Slider controls: Min duration
   minDurationSlider.addEventListener('input', (e) => {
     updateSilenceMinDur(parseFloat(e.target.value));
+    scheduleSilenceAnalysis();
   });
   durChips.forEach(chip => {
     chip.addEventListener('click', () => {
       const val = parseFloat(chip.getAttribute('data-dur'));
       minDurationSlider.value = val;
       updateSilenceMinDur(val);
+      scheduleSilenceAnalysis();
     });
   });
 
   // Slider controls: Margin
   marginSlider.addEventListener('input', (e) => {
     updateSilenceMargin(parseFloat(e.target.value));
+    scheduleSilenceAnalysis();
   });
   marginChips.forEach(chip => {
     chip.addEventListener('click', () => {
       const val = parseFloat(chip.getAttribute('data-margin'));
       marginSlider.value = val;
       updateSilenceMargin(val);
+      scheduleSilenceAnalysis();
     });
   });
 
   // Format radios
   silenceFormatRadios.forEach(radio => {
     radio.addEventListener('change', () => {
-      document.querySelectorAll('#silenceView .radio-card').forEach(c => c.classList.remove('active'));
-      radio.closest('.radio-card').classList.add('active');
       updateSilenceOutputPathExtension(radio.value);
     });
   });
-
-  // Destination browse button
-  browseSilenceDestBtn.addEventListener('click', async () => {
-    if (!window.pywebview || !window.pywebview.api) return;
-    const currentName = silenceOutputPathInput.value.split(/[\\/]/).pop() || "cleaned_voiceover.mp3";
-    try {
-      const selected = await window.pywebview.api.select_save_destination(currentName);
-      if (selected) {
-        silenceOutputPathInput.value = selected;
-      }
-    } catch (err) {
-      alert("Could not select destination: " + err);
-    }
-  });
+  setupRadioCardGroup('silenceFormat');
 
   // Analyze pauses button
   analyzeSilencesBtn.addEventListener('click', executeDetectSilences);
@@ -1104,21 +1110,39 @@ function setupSilenceEventListeners() {
     if (silenceCleanPlayer) silenceCleanPlayer.pause();
   });
 
-  const sendSilenceToTimelineBtn = document.getElementById('sendSilenceToTimelineBtn');
-  if (sendSilenceToTimelineBtn) {
-    sendSilenceToTimelineBtn.addEventListener('click', () => {
-      if (!lastSilenceResult) return;
-      setTimelineActiveAudio(lastSilenceResult);
-      switchTab('timeline');
-      silenceSuccessCard.style.display = 'none';
-      if (silenceCleanPlayer) silenceCleanPlayer.pause();
-    });
-  }
-
   dismissSilenceSuccessBtn.addEventListener('click', () => {
     silenceSuccessCard.style.display = 'none';
     if (silenceCleanPlayer) silenceCleanPlayer.pause();
+    if (silenceCleanVideoPlayer) silenceCleanVideoPlayer.pause();
   });
+
+  sendSilenceVideoToZoomBtn.addEventListener('click', () => {
+    const audioForZoom = lastSilenceResult?.audio_info || lastSilenceResult;
+    if (!lastSilenceResult?.aligned_images?.length || !audioForZoom?.path) return;
+    setZoomActiveMedia(audioForZoom, lastSilenceResult.aligned_images);
+    switchTab('zoom');
+  });
+
+  saveSilenceVideoBtn.addEventListener('click', async () => {
+    if (!lastSilenceResult?.path || !window.pywebview?.api) return;
+    const defaultName = lastSilenceResult.filename || 'synchronized_video.mp4';
+    const destination = await window.pywebview.api.select_save_destination(defaultName);
+    if (!destination) return;
+    const saved = await window.pywebview.api.copy_media_to_destination(lastSilenceResult.path, destination);
+    if (saved?.success) {
+      alert(`Synchronized video saved to:\n${saved.path}`);
+    } else {
+      alert(`Could not save synchronized video: ${saved?.error || 'Unknown error'}`);
+    }
+  });
+}
+
+function scheduleSilenceAnalysis() {
+  if (silenceAnalysisDebounce) clearTimeout(silenceAnalysisDebounce);
+  silenceAnalysisDebounce = setTimeout(() => {
+    silenceAnalysisDebounce = null;
+    executeDetectSilences();
+  }, 350);
 }
 
 function updateSilenceThresh(val) {
@@ -1163,6 +1187,7 @@ function getSilenceSelectedFormat() {
 }
 
 function updateSilenceOutputPathExtension(ext) {
+  if (!silenceOutputPathInput) return;
   let cur = silenceOutputPathInput.value;
   if (cur) {
     const dotIdx = cur.lastIndexOf('.');
@@ -1180,7 +1205,7 @@ async function handleSilenceFiles(files) {
   // If path is directly accessible
   if (files[0].path && window.pywebview && window.pywebview.api) {
     try {
-      const metadataList = await window.pywebview.api.inspect_dropped_files([files[0].path]);
+      const metadataList = await window.pywebview.api.inspect_dropped_media([files[0].path]);
       if (metadataList && metadataList.length > 0 && !metadataList[0].error) {
         setSilenceActiveFile(metadataList[0]);
         return;
@@ -1190,46 +1215,89 @@ async function handleSilenceFiles(files) {
     }
   }
 
-  // Fallback to upload endpoint
+  // Browser fallback: keep the file in the app's imported-media directory.
   const formData = new FormData();
-  formData.append('audio_files', files[0], files[0].name);
+  formData.append('media_files', files[0], files[0].name);
 
   try {
-    const res = await fetch('/upload_audio', {
+    const res = await fetch('/upload_media', {
       method: 'POST',
       body: formData
     });
     const data = await res.json();
-    if (data.success && data.clips && data.clips.length > 0) {
-      setSilenceActiveFile(data.clips[0]);
+    if (data.success && data.path) {
+      const metadata = await window.pywebview.api.inspect_dropped_media([data.path]);
+      if (metadata?.length && !metadata[0].error) {
+        setSilenceActiveFile(metadata[0]);
+      } else {
+        alert(`Could not inspect media: ${metadata?.[0]?.error || 'Unknown error'}`);
+      }
     } else {
-      alert("Error uploading file: " + (data.error || "Unknown"));
+      alert("Error uploading media: " + (data.error || "Unknown"));
     }
   } catch (err) {
-    alert("Could not load audio file: " + err.message);
+    alert("Could not load media file: " + err.message);
   }
 }
 
 function setSilenceActiveFile(clip) {
   silenceActiveFile = clip;
+  lastSilenceResult = null;
+  silenceSuccessCard.style.display = 'none';
+  silenceTelemetryCard.style.display = 'none';
+  const isVideo = clip.media_type === 'video' || /\.(mp4|mov|mkv|webm|avi)$/i.test(clip.filename || clip.path || '');
+  const hasAlignedImages = Array.isArray(clip.aligned_images) && clip.aligned_images.length > 0;
+  silenceActiveFile.media_type = isVideo ? 'video' : 'audio';
   // If this audio was mastered by Stitcher, avoid running loudnorm again by
   // default. Users can still re-enable it explicitly in this workflow.
   silenceNormalize.checked = clip.normalization_applied === true ? false : true;
 
   silenceFileName.textContent = clip.filename;
-  silenceFileFmt.textContent = clip.format_name.toUpperCase();
-  silenceFileDur.textContent = clip.duration_formatted;
+  silenceFileFmt.textContent = (clip.format_name || (isVideo ? 'MP4' : 'Audio')).toUpperCase();
+  silenceFileDur.textContent = clip.duration_formatted || '00:00';
   silenceFileSr.textContent = `${(clip.sample_rate / 1000).toFixed(1)} kHz`;
   silenceFileSize.textContent = clip.size_formatted;
 
-  silenceOriginalPlayer.src = `/stream_audio?path=${encodeURIComponent(clip.path)}&t=${Date.now()}`;
+  silenceOriginalPlayer.pause();
+  silenceOriginalVideoPlayer.pause();
+  silenceOriginalPlayer.style.display = isVideo ? 'none' : 'block';
+  silenceOriginalVideoPlayer.style.display = isVideo ? 'block' : 'none';
+  if (isVideo) {
+    silenceOriginalVideoPlayer.src = `/stream_video?path=${encodeURIComponent(clip.path)}&t=${Date.now()}`;
+    silenceOriginalVideoPlayer.load();
+    silenceFileFmt.textContent = 'MP4 VIDEO';
+    silenceFileSr.textContent = `${clip.width || '—'}×${clip.height || '—'} · ${Math.round(clip.fps || 30)} FPS`;
+  } else {
+    silenceOriginalVideoPlayer.removeAttribute('src');
+    silenceOriginalVideoPlayer.load();
+    silenceOriginalPlayer.src = `/stream_audio?path=${encodeURIComponent(clip.path)}&t=${Date.now()}`;
+    silenceFileFmt.textContent = (clip.format_name || 'Audio').toUpperCase();
+    silenceFileSr.textContent = `${((clip.sample_rate || 48000) / 1000).toFixed(1)} kHz`;
+  }
 
   silenceDropzone.style.display = 'none';
   silenceAudioCard.style.display = 'block';
+  renderSilenceAlignedImages(clip.aligned_images || []);
+  silenceAudioOutputSettings.style.display = (isVideo || hasAlignedImages) ? 'none' : 'block';
+  silenceVideoOutputNote.style.display = (isVideo || hasAlignedImages) ? 'block' : 'none';
+  if (hasAlignedImages && !isVideo) {
+    silenceVideoOutputNote.textContent = 'The aligned image sequence will be retimed with the cleaned voiceover. No draft video is rendered or downloaded; continue to Zoom & Transitions when ready.';
+  } else if (isVideo) {
+    silenceVideoOutputNote.textContent = 'The synchronized MP4 stays available inside the app for preview and handoff. Saving it is optional.';
+  }
+  document.getElementById('silenceRemoveButtonLabel').textContent = isVideo
+    ? 'Remove Silence & Retiming Video'
+    : hasAlignedImages ? 'Remove Pauses & Retiming Images'
+    : 'Cut Silences';
+  sendSilenceVideoToZoomBtn.style.display = 'none';
+  saveSilenceVideoBtn.style.display = 'none';
+  document.getElementById('sendToStitcherBtn').style.display = (isVideo || hasAlignedImages) ? 'none' : '';
 
-  const baseName = clip.filename.replace(/\.[^/.]+$/, "");
-  const fmt = getSilenceSelectedFormat();
-  silenceOutputPathInput.value = `${baseName}_cleaned.${fmt}`;
+  if (silenceOutputPathInput) {
+    const baseName = clip.filename.replace(/\.[^/.]+$/, "");
+    const fmt = getSilenceSelectedFormat();
+    silenceOutputPathInput.value = (isVideo || hasAlignedImages) ? '' : `${baseName}_cleaned.${fmt}`;
+  }
 
   analyzeSilencesBtn.disabled = false;
   startSilenceRemovalBtn.disabled = false;
@@ -1238,17 +1306,40 @@ function setSilenceActiveFile(clip) {
   executeDetectSilences();
 }
 
+function renderSilenceAlignedImages(items) {
+  const card = document.getElementById('silenceAlignedImagesCard');
+  const grid = document.getElementById('silenceAlignedImagesGrid');
+  const count = document.getElementById('silenceAlignedImagesCount');
+  if (!card || !grid || !count) return;
+  if (!items.length) {
+    card.style.display = 'none';
+    grid.replaceChildren();
+    return;
+  }
+  count.textContent = `${items.length} images`;
+  const fragment = document.createDocumentFragment();
+  items.forEach((item, index) => {
+    const tile = document.createElement('div');
+    tile.className = 'timeline-card';
+    tile.innerHTML = `<div class="timeline-card-thumb-box"><img class="timeline-card-thumb" src="/thumbnail_image?path=${encodeURIComponent(item.path)}&width=360&v=${encodeURIComponent(item.thumbnail_version || '')}" alt="${item.filename}" loading="lazy" decoding="async"><span class="timeline-card-seq-badge">#${index + 1}</span></div><div class="timeline-card-body"><div class="timeline-card-title" title="${item.filename}">${item.filename}</div><div class="timeline-card-timing"><span class="timeline-pill-time">${item.start_formatted} âž” ${item.end_formatted}</span><span class="timeline-pill-dur">${item.duration_formatted}</span></div></div>`;
+    fragment.appendChild(tile);
+  });
+  grid.replaceChildren(fragment);
+  card.style.display = 'block';
+}
+
 async function executeDetectSilences() {
   if (!silenceActiveFile || !window.pywebview || !window.pywebview.api) return;
 
   const thresh = parseFloat(thresholdSlider.value) || -40.0;
   const minDur = parseFloat(minDurationSlider.value) || 0.4;
+  const margin = Number.isFinite(parseFloat(marginSlider.value)) ? parseFloat(marginSlider.value) : 80.0;
 
   silenceBadgeStats.textContent = "Analyzing Audio...";
   analyzeSilencesBtn.disabled = true;
 
   try {
-    const res = await window.pywebview.api.detect_silences(silenceActiveFile.path, thresh, minDur);
+    const res = await window.pywebview.api.detect_silences(silenceActiveFile.path, thresh, minDur, margin);
     if (res.success) {
       silenceCountStat.textContent = res.silence_count;
       silenceSavedStat.textContent = `${res.total_silence_sec}s (${res.percent_saved}%)`;
@@ -1307,17 +1398,13 @@ function renderDetectedSilencesList(segments) {
 async function executeRemoveSilences() {
   if (!silenceActiveFile || !window.pywebview || !window.pywebview.api) return;
 
-  let outPath = silenceOutputPathInput.value.trim();
-  if (!outPath) {
-    alert("Please specify an export destination file.");
-    return;
-  }
+  const isVideo = silenceActiveFile.media_type === 'video';
+  const hasAlignedImages = Array.isArray(silenceActiveFile.aligned_images) && silenceActiveFile.aligned_images.length > 0;
 
   const thresh = parseFloat(thresholdSlider.value) || -40.0;
   const minDur = parseFloat(minDurationSlider.value) || 0.4;
-  const margin = parseFloat(marginSlider.value) || 80.0;
+  const margin = Number.isFinite(parseFloat(marginSlider.value)) ? parseFloat(marginSlider.value) : 80.0;
   const normalize = silenceNormalize.checked;
-  const fmt = getSilenceSelectedFormat();
 
   silenceProgressCard.style.display = 'block';
   silenceSuccessCard.style.display = 'none';
@@ -1329,17 +1416,22 @@ async function executeRemoveSilences() {
   silenceProgressStatusText.textContent = "Analyzing audio waveform...";
 
   try {
-    await window.pywebview.api.start_remove_silences(
-      silenceActiveFile.path,
-      outPath,
-      thresh,
-      minDur,
-      margin,
-      normalize,
-      48000,
-      fmt,
-      320
-    );
+    if (isVideo) {
+      await window.pywebview.api.start_remove_video_silences(
+        silenceActiveFile.path,
+        silenceActiveFile.aligned_images || [], thresh, minDur, margin, normalize, true
+      );
+    } else if (hasAlignedImages) {
+      await window.pywebview.api.start_remove_aligned_audio_silences(
+        silenceActiveFile.path,
+        silenceActiveFile.aligned_images,
+        thresh, minDur, margin, normalize
+      );
+    } else {
+      await window.pywebview.api.start_remove_silences_internal(
+        silenceActiveFile.path, thresh, minDur, margin, normalize
+      );
+    }
   } catch (err) {
     alert("Error starting silence removal: " + err);
     resetSilenceProgress();
@@ -1355,6 +1447,7 @@ window.onSilenceProgress = function(percent, statusMsg) {
 
 window.onSilenceComplete = function(result) {
   resetSilenceProgress();
+  const isVideo = result.media_type === 'video';
   const outputClip = result.output_info || result;
   const filePath = result.path || outputClip.path;
   const durationFormatted = result.trimmed_duration_formatted || result.duration_formatted || outputClip.duration_formatted || "00:00";
@@ -1369,16 +1462,45 @@ window.onSilenceComplete = function(result) {
     duration_formatted: durationFormatted,
     format_name: result.format_name || outputClip.format_name || "MP3",
     sample_rate: result.sample_rate || outputClip.sample_rate || 48000,
-    size_formatted: result.size_formatted || outputClip.size_formatted || "0 KB"
+    size_formatted: result.size_formatted || outputClip.size_formatted || "0 KB",
+    media_type: isVideo ? 'video' : 'audio',
+    video_info: result.video_info || null,
+    audio_path: result.audio_path || null,
+    audio_info: result.audio_info || null,
+    aligned_images: result.aligned_images || []
   };
 
   silenceSuccessCard.style.display = 'block';
   silenceSuccessDetails.textContent = `Saved ${savedSec}s (${savedPct}%) • ${pauseCount} pauses cut • New Duration: ${durationFormatted}`;
-
-  if (filePath) {
-    const streamUrl = `/stream_audio?path=${encodeURIComponent(filePath)}&t=${Date.now()}`;
-    silenceCleanPlayer.src = streamUrl;
+  if (isVideo) {
+    const imageSummary = lastSilenceResult.aligned_images.length
+      ? ` • ${lastSilenceResult.aligned_images.length} image segments retimed`
+      : ' • source video frames trimmed in sync';
+    silenceSuccessDetails.textContent = `Synchronized video ready • ${savedSec}s (${savedPct}%) removed • ${pauseCount} pauses cut • ${durationFormatted}${imageSummary}`;
+  } else if (lastSilenceResult.aligned_images.length) {
+    silenceSuccessDetails.textContent = `Voiceover cleaned • ${savedSec}s removed • ${pauseCount} pauses cut • ${durationFormatted} • ${lastSilenceResult.aligned_images.length} image segments retimed`;
+  }
+  silenceCleanPlayer.pause();
+  silenceCleanVideoPlayer.pause();
+  silenceCleanPlayer.style.display = isVideo ? 'none' : 'block';
+  silenceCleanVideoPlayer.style.display = isVideo ? 'block' : 'none';
+  if (filePath && isVideo) {
+    silenceCleanVideoPlayer.src = `/stream_video?path=${encodeURIComponent(filePath)}&t=${Date.now()}`;
+    silenceCleanVideoPlayer.load();
+    sendSilenceVideoToZoomBtn.style.display = lastSilenceResult.aligned_images.length ? '' : 'none';
+    saveSilenceVideoBtn.style.display = '';
+    sendToStitcherBtn.style.display = 'none';
+  } else if (filePath) {
+    silenceCleanVideoPlayer.removeAttribute('src');
+    silenceCleanVideoPlayer.load();
+    silenceCleanPlayer.src = `/stream_audio?path=${encodeURIComponent(filePath)}&t=${Date.now()}`;
     silenceCleanPlayer.load();
+    sendSilenceVideoToZoomBtn.style.display = lastSilenceResult.aligned_images.length ? '' : 'none';
+    saveSilenceVideoBtn.style.display = 'none';
+    sendToStitcherBtn.style.display = lastSilenceResult.aligned_images.length ? 'none' : '';
+  }
+  if (lastSilenceResult.aligned_images.length) {
+    renderSilenceAlignedImages(lastSilenceResult.aligned_images);
   }
 };
 
@@ -1413,8 +1535,8 @@ let timelineAudioDropzone, timelineAudioInput, timelineActiveAudioBar;
 let timelineAudioName, timelineAudioMeta, timelineAudioPlayer, changeTimelineAudioBtn;
 let statTimelineImgCount, statTimelineAudioDur, statTimelineCoverage;
 let timelineImagesDropzone, timelineImageInput, timelineSequenceContainer;
-let addMoreImagesBtn, realignTimelineBtn, exportCueSheetBtn, clearImagesBtn, sendToZoomBtn, timelineCardsGrid;
-let timelineNvencToggle, timelineOutputPathInput, browseTimelineDestBtn, startRenderVideoBtn;
+let addMoreImagesBtn, realignTimelineBtn, exportCueSheetBtn, clearImagesBtn, sendToZoomBtn, sendTimelineAudioToSilenceBtn, timelineCardsGrid;
+let timelineNvencToggle, startRenderVideoBtn;
 let timelineProgressCard, timelineProgressStatusText, timelineProgressPercent, timelineProgressBarFill, cancelTimelineRenderBtn;
 let timelineSuccessCard, timelineSuccessDetails, timelineVideoPlayer, openTimelineVideoFolderBtn, dismissTimelineSuccessBtn;
 
@@ -1440,11 +1562,10 @@ function initTimelineAligner() {
   exportCueSheetBtn = document.getElementById('exportCueSheetBtn');
   clearImagesBtn = document.getElementById('clearImagesBtn');
   sendToZoomBtn = document.getElementById('sendToZoomBtn');
+  sendTimelineAudioToSilenceBtn = document.getElementById('sendTimelineAudioToSilenceBtn');
   timelineCardsGrid = document.getElementById('timelineCardsGrid');
 
   timelineNvencToggle = document.getElementById('timelineNvencToggle');
-  timelineOutputPathInput = document.getElementById('timelineOutputPathInput');
-  browseTimelineDestBtn = document.getElementById('browseTimelineDestBtn');
   startRenderVideoBtn = document.getElementById('startRenderVideoBtn');
 
   timelineProgressCard = document.getElementById('timelineProgressCard');
@@ -1559,12 +1680,7 @@ function setupTimelineEventListeners() {
   });
 
   // Resolution radio cards
-  document.querySelectorAll('input[name="videoRes"]').forEach(radio => {
-    radio.addEventListener('change', () => {
-      document.querySelectorAll('#timelineView .radio-card').forEach(c => c.classList.remove('active'));
-      radio.closest('.radio-card').classList.add('active');
-    });
-  });
+  setupRadioCardGroup('videoRes');
 
   // Re-align button
   realignTimelineBtn.addEventListener('click', () => {
@@ -1608,18 +1724,17 @@ function setupTimelineEventListeners() {
     switchTab('zoom');
   });
 
-  // Browse output destination
-  browseTimelineDestBtn.addEventListener('click', async () => {
-    if (!window.pywebview || !window.pywebview.api) return;
-    const currentName = timelineOutputPathInput.value.split(/[\\/]/).pop() || "aligned_video.mp4";
-    try {
-      const selected = await window.pywebview.api.select_save_destination(currentName);
-      if (selected) {
-        timelineOutputPathInput.value = selected;
-      }
-    } catch (err) {
-      alert("Could not select destination: " + err);
+  sendTimelineAudioToSilenceBtn.addEventListener('click', () => {
+    if (!timelineActiveAudio || alignedTimelineItems.length === 0) {
+      alert("Load voiceover and align images before removing pauses.");
+      return;
     }
+    setSilenceActiveFile({
+      ...timelineActiveAudio,
+      media_type: 'audio',
+      aligned_images: alignedTimelineItems.map(item => ({ ...item }))
+    });
+    switchTab('silence');
   });
 
   // Start Render Video button
@@ -1635,7 +1750,12 @@ function setupTimelineEventListeners() {
   // Success Card actions
   openTimelineVideoFolderBtn.addEventListener('click', async () => {
     if (lastTimelineRenderResult && window.pywebview && window.pywebview.api) {
-      await window.pywebview.api.open_folder(lastTimelineRenderResult.path);
+      const destination = await window.pywebview.api.select_save_destination(
+        lastTimelineRenderResult.filename || 'aligned_video.mp4'
+      );
+      if (!destination) return;
+      const saved = await window.pywebview.api.copy_media_to_destination(lastTimelineRenderResult.path, destination);
+      if (!saved?.success) alert(`Could not download aligned video: ${saved?.error || 'Unknown error'}`);
     }
   });
 
@@ -1645,6 +1765,7 @@ function setupTimelineEventListeners() {
       timelineVideoPlayer.pause();
     }
   });
+
 }
 
 async function handleTimelineAudioUpload(file) {
@@ -1689,7 +1810,6 @@ function setTimelineActiveAudio(audioMeta) {
 
   statTimelineAudioDur.textContent = audioMeta.duration_formatted;
 
-  suggestTimelineVideoOutputPath();
   recalculateTimelineAlignment();
 }
 
@@ -1845,26 +1965,15 @@ function renderTimelineCards() {
   statTimelineImgCount.textContent = alignedTimelineItems.length;
   statTimelineCoverage.textContent = timelineActiveAudio ? '100%' : 'No Audio';
 
-  startRenderVideoBtn.disabled = !(timelineActiveAudio && alignedTimelineItems.length > 0);
-  suggestTimelineVideoOutputPath();
-}
-
-function suggestTimelineVideoOutputPath() {
-  if (!timelineOutputPathInput.value) {
-    const ts = new Date().toISOString().slice(0, 10);
-    timelineOutputPathInput.value = `aligned_video_${ts}.mp4`;
-  }
+  const ready = !!(timelineActiveAudio && alignedTimelineItems.length > 0);
+  startRenderVideoBtn.disabled = !ready;
+  sendToZoomBtn.disabled = !ready;
+  sendTimelineAudioToSilenceBtn.disabled = !ready;
 }
 
 async function executeTimelineRender() {
   if (!timelineActiveAudio || alignedTimelineItems.length === 0) {
     alert("Please ensure both voiceover audio and images are added to the timeline.");
-    return;
-  }
-
-  let outPath = timelineOutputPathInput.value.trim();
-  if (!outPath) {
-    alert("Please specify a video export destination.");
     return;
   }
 
@@ -1893,10 +2002,9 @@ async function executeTimelineRender() {
   timelineProgressStatusText.textContent = "Initializing video rendering pipeline...";
 
   try {
-    await window.pywebview.api.start_render_timeline_video(
+    await window.pywebview.api.start_render_timeline_video_internal(
       alignedTimelineItems,
       timelineActiveAudio.path,
-      outPath,
       width,
       height,
       fps,
@@ -2046,12 +2154,7 @@ function initZoomTransitions() {
       document.getElementById('zoomFpsDisplay').textContent = `${chip.dataset.zoomFps} FPS`;
     });
   });
-  document.querySelectorAll('input[name="zoomVideoRes"]').forEach(radio => {
-    radio.addEventListener('change', () => {
-      document.querySelectorAll('#zoomView .radio-card').forEach(c => c.classList.remove('active'));
-      radio.closest('.radio-card').classList.add('active');
-    });
-  });
+  setupRadioCardGroup('zoomVideoRes');
   zoomTransitionDuration.addEventListener('input', () => {
     document.getElementById('zoomTransitionDurationDisplay').textContent = `${parseFloat(zoomTransitionDuration.value).toFixed(2)}s`;
     const percentage = ((zoomTransitionDuration.value - zoomTransitionDuration.min) / (zoomTransitionDuration.max - zoomTransitionDuration.min)) * 100;

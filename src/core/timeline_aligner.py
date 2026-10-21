@@ -249,6 +249,63 @@ class TimelineAligner:
 
         return aligned
 
+    @staticmethod
+    def retime_aligned_images(
+        aligned_images: List[Dict[str, Any]],
+        kept_intervals: List[Tuple[float, float]],
+    ) -> List[Dict[str, Any]]:
+        """Map still-image spans through the audio silence-removal time warp.
+
+        Each retained source-audio interval is placed next to the previous one
+        on the new timeline. Image intervals are intersected with those kept
+        ranges; an image spanning a removed pause consequently gets a shorter
+        continuous duration, and images wholly inside removed silence vanish.
+        """
+        if not aligned_images or not kept_intervals:
+            return []
+
+        mapped: List[Dict[str, Any]] = []
+        output_cursor = 0.0
+        ordered_images = sorted(aligned_images, key=lambda item: float(item["start_sec"]))
+        for kept_start, kept_end in kept_intervals:
+            kept_start = max(0.0, float(kept_start))
+            kept_end = max(kept_start, float(kept_end))
+            if kept_end - kept_start <= 0.0005:
+                continue
+
+            for image in ordered_images:
+                image_start = max(0.0, float(image["start_sec"]))
+                image_end = max(image_start, float(image["end_sec"]))
+                overlap_start = max(image_start, kept_start)
+                overlap_end = min(image_end, kept_end)
+                if overlap_end - overlap_start <= 0.0005:
+                    continue
+
+                mapped_start = output_cursor + overlap_start - kept_start
+                mapped_end = output_cursor + overlap_end - kept_start
+                if (
+                    mapped
+                    and mapped[-1].get("path") == image.get("path")
+                    and abs(float(mapped[-1]["end_sec"]) - mapped_start) < 0.002
+                ):
+                    mapped[-1]["end_sec"] = round(mapped_end, 3)
+                    mapped[-1]["duration"] = round(mapped_end - float(mapped[-1]["start_sec"]), 3)
+                else:
+                    mapped.append({
+                        **image,
+                        "start_sec": round(mapped_start, 3),
+                        "end_sec": round(mapped_end, 3),
+                        "duration": round(mapped_end - mapped_start, 3),
+                    })
+            output_cursor += kept_end - kept_start
+
+        for index, item in enumerate(mapped):
+            item["index"] = index
+            item["start_formatted"] = format_seconds_to_time(item["start_sec"])
+            item["end_formatted"] = format_seconds_to_time(item["end_sec"])
+            item["duration_formatted"] = f"{item['duration']:.2f}s"
+        return mapped
+
     def render_video(
         self,
         aligned_images: List[Dict[str, Any]],

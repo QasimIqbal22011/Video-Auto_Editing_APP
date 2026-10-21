@@ -20,6 +20,7 @@ bottle.BaseRequest.MEMFILE_MAX = 64 * 1024 * 1024
 _AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma'}
 _IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 _VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mov', '.mkv', '.avi'}
+_MEDIA_EXTENSIONS = _AUDIO_EXTENSIONS | _VIDEO_EXTENSIONS
 _THUMBNAIL_WORKERS = threading.BoundedSemaphore(4)
 
 
@@ -94,6 +95,8 @@ def create_app(web_dir: str, media_registry: MediaPathRegistry | None = None):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     import_dir = os.path.join(base_dir, 'imported_audio')
     os.makedirs(import_dir, exist_ok=True)
+    imported_media_dir = os.path.join(base_dir, 'imported_media')
+    os.makedirs(imported_media_dir, exist_ok=True)
 
     @app.route('/')
     def index():
@@ -171,6 +174,35 @@ def create_app(web_dir: str, media_registry: MediaPathRegistry | None = None):
 
         except Exception as e:
             return json.dumps({"success": False, "clips": [], "error": str(e)})
+
+    @app.route('/upload_media', method=['POST', 'OPTIONS'])
+    def upload_media():
+        """Upload one audio or video source for the Silence Remover."""
+        response.content_type = 'application/json'
+        response.set_header("Access-Control-Allow-Origin", "*")
+        if request.method == 'OPTIONS':
+            return "{}"
+        try:
+            uploaded = request.files.getall('media_files')
+            if not uploaded:
+                return json.dumps({"success": False, "media": None, "error": "No media file received."})
+            name = _safe_upload_name(uploaded[0].filename, _MEDIA_EXTENSIONS)
+            base_name, ext = os.path.splitext(name)
+            destination = os.path.join(imported_media_dir, name)
+            counter = 1
+            while os.path.exists(destination):
+                destination = os.path.join(imported_media_dir, f"{base_name}_{counter}{ext}")
+                counter += 1
+            uploaded[0].save(destination, overwrite=True)
+            media_registry.register(destination)
+            return json.dumps({
+                "success": True,
+                "path": destination,
+                "filename": os.path.basename(destination),
+                "media_type": "video" if ext.lower() in _VIDEO_EXTENSIONS else "audio",
+            })
+        except Exception as exc:
+            return json.dumps({"success": False, "media": None, "error": str(exc)})
 
     # Directory for imported images
     image_import_dir = os.path.join(base_dir, 'imported_images')

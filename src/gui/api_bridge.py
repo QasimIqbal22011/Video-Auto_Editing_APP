@@ -4,11 +4,14 @@ import subprocess
 import threading
 import json
 import platform
+import shutil
+import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Callable, Optional
 import webview
 
-from ..core.ffmpeg_utils import get_audio_info, get_ffmpeg_path
+from ..core.ffmpeg_utils import get_audio_info, get_video_info, get_ffmpeg_path
 from ..core.audio_stitcher import AudioStitcher
 from ..core.silence_remover import AudioSilenceRemover
 from ..core.timeline_aligner import TimelineAligner, parse_timestamp_from_filename
@@ -134,6 +137,30 @@ class ApiBridge:
         ]
         return self._inspect_audio_files(valid_paths)
 
+    def inspect_dropped_media(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """Inspect audio/video sources accepted by Silence Remover."""
+        audio_exts = {'.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma'}
+        video_exts = {'.mp4', '.webm', '.mov', '.mkv', '.avi'}
+        results = []
+        for path in file_paths:
+            if not os.path.isfile(path):
+                continue
+            extension = os.path.splitext(path)[1].lower()
+            if extension in video_exts:
+                try:
+                    info = get_video_info(path)
+                    info['media_type'] = 'video'
+                    self._media_registry.register(path)
+                    results.append(info)
+                except Exception as exc:
+                    results.append({'path': path, 'filename': os.path.basename(path), 'error': str(exc)})
+            elif extension in audio_exts:
+                info = self._inspect_audio_file(path)
+                if not info.get('error'):
+                    info['media_type'] = 'audio'
+                results.append(info)
+        return results
+
     def select_save_destination(self, default_name: str = "stitched_master.mp3") -> Optional[str]:
         """
         Opens native Windows Save As dialog.
@@ -146,6 +173,58 @@ class ApiBridge:
         except Exception as e:
             log_error(f"[ApiBridge] Error in pick_save: {e}")
             return None
+
+    def copy_media_to_destination(self, source_path: str, destination_path: str) -> Dict[str, Any]:
+        """Save an internally processed media item to a user-selected path."""
+        try:
+            source = self._media_registry.resolve(
+                source_path,
+                {'.mp4', '.webm', '.mov', '.mkv', '.avi', '.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma'},
+            )
+            if not source:
+                return {"success": False, "error": "The processed media is no longer available."}
+            destination = self._resolve_output_path(destination_path)
+            if os.path.normcase(os.path.realpath(source)) == os.path.normcase(os.path.realpath(destination)):
+                return {"success": True, "path": destination}
+            os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+            shutil.copy2(source, destination)
+            self._media_registry.register(destination)
+            return {"success": True, "path": destination}
+        except Exception as exc:
+            log_error(f"[ApiBridge] Could not save processed media: {exc}")
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def _internal_media_path(stem: str, extension: str) -> str:
+        """Return a unique, app-managed working output path.
+
+        Workflow handoffs must not depend on a user choosing a download path.
+        Completed media remains available for preview and can later be copied to
+        a user-selected destination through ``copy_media_to_destination``.
+        """
+        media_root = os.path.join(
+            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+            "VideoHelperStudio", "processed_media",
+        )
+        os.makedirs(media_root, exist_ok=True)
+        extension = extension if extension.startswith(".") else f".{extension}"
+        return os.path.join(media_root, f"{stem}_{uuid.uuid4().hex[:10]}{extension}")
+
+    def start_stitch_internal(
+        self,
+        file_paths: List[str],
+        gap_sec: float = 0.3,
+        normalize_audio: bool = True,
+        sample_rate: int = 48000,
+        output_format: str = "mp3",
+        bitrate_kbps: int = 320,
+    ):
+        """Stitch audio into internal working storage for preview and handoff."""
+        output_path = self._internal_media_path("stitched_master", output_format)
+        return self.start_stitch(
+            file_paths, output_path, gap_sec, normalize_audio,
+            sample_rate, output_format, bitrate_kbps,
+        )
 
     def start_stitch(
         self,
@@ -277,7 +356,8 @@ class ApiBridge:
         self,
         file_path: str,
         threshold_db: float = -40.0,
-        min_duration_sec: float = 0.4
+        min_duration_sec: float = 0.4,
+        margin_ms: float = 80.0,
     ) -> Dict[str, Any]:
         """
         Analyzes audio file for silences without exporting, returning telemetry.
@@ -289,14 +369,22 @@ class ApiBridge:
                 threshold_db=threshold_db,
                 min_duration_sec=min_duration_sec
             )
-            total_silence_sec = sum(s['duration'] for s in silences)
-            new_dur = max(0.0, total_dur - total_silence_sec)
-            pct_saved = round((total_silence_sec / max(0.001, total_dur)) * 100, 1)
+            frame_rate = None
+            if os.path.splitext(file_path)[1].lower() in {'.mp4', '.mov', '.mkv', '.webm', '.avi'}:
+                video_info = get_video_info(file_path)
+                total_dur = min(total_dur, float(video_info['duration']))
+                frame_rate = float(video_info.get('fps') or 30.0)
+            retained_intervals = self._silence_remover.compute_retained_intervals(
+                silences, total_dur, margin_ms=margin_ms, frame_rate=frame_rate
+            )
+            new_dur = sum(end - start for start, end in retained_intervals)
+            cut_duration = max(0.0, total_dur - new_dur)
+            pct_saved = round((cut_duration / max(0.001, total_dur)) * 100, 1)
 
             return {
                 "success": True,
                 "silence_count": len(silences),
-                "total_silence_sec": round(total_silence_sec, 2),
+                "total_silence_sec": round(cut_duration, 2),
                 "total_duration": total_dur,
                 "total_duration_formatted": f"{int(total_dur // 60):02d}:{int(total_dur % 60):02d}",
                 "expected_trimmed_duration": round(new_dur, 2),
@@ -357,6 +445,145 @@ class ApiBridge:
                     self._emit_js("onSilenceError", str(e))
 
         return self._start_job("silence", run, "onSilenceError")
+
+    def start_remove_video_silences(
+        self,
+        file_path: str,
+        aligned_images: Optional[List[Dict[str, Any]]] = None,
+        threshold_db: float = -40.0,
+        min_duration_sec: float = 0.4,
+        margin_ms: float = 80.0,
+        normalize_audio: bool = True,
+        use_hardware_accel: bool = True,
+    ):
+        """Trim video and audio together; keep the result internal for handoffs."""
+        video_info = get_video_info(file_path)
+        media_root = os.path.join(
+            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+            "VideoHelperStudio",
+            "processed_media",
+        )
+        os.makedirs(media_root, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        output_path = os.path.join(media_root, f"{stem}_silence_synced_{uuid.uuid4().hex[:8]}.mp4")
+        log_info(f"[ApiBridge] start_remove_video_silences: {file_path} -> internal synchronized video")
+
+        def run():
+            def on_progress(pct: float, msg: str):
+                if self._window:
+                    self._emit_js("onSilenceProgress", pct, msg)
+
+            try:
+                result = self._silence_remover.remove_silences_from_video(
+                    file_path=file_path,
+                    output_path=output_path,
+                    threshold_db=threshold_db,
+                    min_duration_sec=min_duration_sec,
+                    margin_ms=margin_ms,
+                    normalize_audio=normalize_audio,
+                    use_hardware_accel=use_hardware_accel,
+                    progress_callback=on_progress,
+                )
+                result["media_type"] = "video"
+                result["aligned_images"] = self._timeline_aligner.retime_aligned_images(
+                    aligned_images or [],
+                    [(float(start), float(end)) for start, end in result["kept_intervals"]],
+                )
+                self._media_registry.register(result["path"])
+                self._media_registry.register(result["audio_path"])
+                if self._window:
+                    self._emit_js("onSilenceComplete", result)
+            except InterruptedError:
+                if self._window:
+                    self._emit_js("onSilenceCancelled")
+            except Exception as exc:
+                log_error("[ApiBridge] Error during synchronized video silence removal:", exc)
+                if self._window:
+                    self._emit_js("onSilenceError", str(exc))
+
+        return self._start_job("silence", run, "onSilenceError")
+
+    def start_remove_aligned_audio_silences(
+        self,
+        file_path: str,
+        aligned_images: List[Dict[str, Any]],
+        threshold_db: float = -40.0,
+        min_duration_sec: float = 0.4,
+        margin_ms: float = 80.0,
+        normalize_audio: bool = True,
+    ):
+        """Trim only the aligned voiceover, then retime its still-image map.
+
+        This pre-render handoff avoids creating or saving a draft MP4. The
+        effects renderer receives the trimmed audio and remapped images next.
+        """
+        if not aligned_images:
+            raise ValueError("Align at least one image before sending the timeline to Silence Remover.")
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Input audio not found: {file_path}")
+
+        media_root = os.path.join(
+            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+            "VideoHelperStudio", "processed_media",
+        )
+        os.makedirs(media_root, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        output_path = os.path.join(media_root, f"{stem}_silence_audio_{uuid.uuid4().hex[:8]}.m4a")
+
+        def run():
+            def on_progress(pct: float, msg: str):
+                if self._window:
+                    self._emit_js("onSilenceProgress", pct, msg)
+
+            try:
+                result = self._silence_remover.remove_silences(
+                    file_path=file_path,
+                    output_path=output_path,
+                    threshold_db=threshold_db,
+                    min_duration_sec=min_duration_sec,
+                    margin_ms=margin_ms,
+                    normalize_audio=normalize_audio,
+                    sample_rate=48000,
+                    output_format="m4a",
+                    bitrate_kbps=320,
+                    progress_callback=on_progress,
+                )
+                result["media_type"] = "audio"
+                result["aligned_images"] = self._timeline_aligner.retime_aligned_images(
+                    aligned_images,
+                    [(float(start), float(end)) for start, end in result["kept_intervals"]],
+                )
+                self._media_registry.register(result["path"])
+                if self._window:
+                    self._emit_js("onSilenceComplete", result)
+            except InterruptedError:
+                if self._window:
+                    self._emit_js("onSilenceCancelled")
+            except Exception as exc:
+                log_error("[ApiBridge] Error trimming aligned timeline audio:", exc)
+                if self._window:
+                    self._emit_js("onSilenceError", str(exc))
+
+        return self._start_job("silence", run, "onSilenceError")
+
+    def start_remove_silences_internal(
+        self,
+        file_path: str,
+        threshold_db: float = -40.0,
+        min_duration_sec: float = 0.4,
+        margin_ms: float = 80.0,
+        normalize_audio: bool = True,
+    ):
+        """Trim a bare voiceover into internal storage for preview and handoff.
+
+        Mirrors the aligned-audio handoff but carries no image timeline. The
+        cleaned master stays inside the app and is only saved on demand.
+        """
+        output_path = self._internal_media_path("silenced_master", "mp3")
+        return self.start_remove_silences(
+            file_path, output_path, threshold_db, min_duration_sec, margin_ms,
+            normalize_audio, 48000, "mp3", 320,
+        )
 
     def cancel_silence_removal(self):
         """Cancels an in-flight silence removal process."""
@@ -461,6 +688,27 @@ class ApiBridge:
                     self._emit_js("onTimelineVideoError", str(e))
 
         return self._start_job("render", run, "onTimelineVideoError")
+
+    def start_render_timeline_video_internal(
+        self,
+        aligned_images: List[Dict[str, Any]],
+        audio_path: str,
+        width: int = 1920,
+        height: int = 1080,
+        fps: int = 30,
+        use_hardware_accel: bool = True,
+        zoom_type: str = "none",
+        zoom_amount: float = 0.12,
+        transition_type: str = "hard_cut",
+        transition_duration: float = 0.5,
+    ):
+        """Render an optional aligned-video preview without requesting a save path."""
+        output_path = self._internal_media_path("aligned_preview", "mp4")
+        return self.start_render_timeline_video(
+            aligned_images, audio_path, output_path, width, height, fps,
+            use_hardware_accel, zoom_type, zoom_amount,
+            transition_type, transition_duration,
+        )
 
     def cancel_timeline_video(self):
         """Cancels an ongoing timeline video render."""
