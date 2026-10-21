@@ -4,6 +4,7 @@ import re
 import subprocess
 import shutil
 import tempfile
+from functools import lru_cache
 from typing import Optional, Dict, Any, List, Callable
 
 def get_ffmpeg_path() -> str:
@@ -74,11 +75,82 @@ def get_audio_info(file_path: str) -> Dict[str, Any]:
             'size_formatted': str
         }
     """
-    if not os.path.exists(file_path):
+    if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    resolved_path = os.path.realpath(file_path)
+    stat = os.stat(resolved_path)
     ffmpeg_bin = get_ffmpeg_path()
-    file_size = os.path.getsize(file_path)
+    cached = _get_audio_info_cached(
+        resolved_path,
+        stat.st_size,
+        stat.st_mtime_ns,
+        ffmpeg_bin
+    )
+    # Do not expose the cached mapping to callers that might mutate it.
+    return cached.copy()
+
+
+def get_video_info(file_path: str) -> Dict[str, Any]:
+    """Probe a video container and require at least one video and audio stream."""
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    audio_info = get_audio_info(file_path)
+    ffmpeg_bin = get_ffmpeg_path()
+    startupinfo = None
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+
+    proc = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-i", file_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        startupinfo=startupinfo,
+        check=False,
+    )
+    video_line = next(
+        (line for line in proc.stderr.splitlines() if re.search(r"Video:", line)),
+        None,
+    )
+    has_audio = any(re.search(r"Audio:", line) for line in proc.stderr.splitlines())
+    if video_line is None:
+        raise ValueError("The selected file does not contain a video stream.")
+    if not has_audio:
+        raise ValueError("The selected video has no audio stream for silence analysis.")
+
+    dimensions = re.search(r"\b(\d{2,5})x(\d{2,5})\b", video_line)
+    if not dimensions:
+        raise ValueError("Could not determine the video dimensions.")
+    fps_match = re.search(r"\b(\d+(?:\.\d+)?)\s+fps\b", video_line)
+    fps = float(fps_match.group(1)) if fps_match else 30.0
+    if not 1.0 <= fps <= 240.0:
+        fps = 30.0
+
+    return {
+        **audio_info,
+        "media_type": "video",
+        "width": int(dimensions.group(1)),
+        "height": int(dimensions.group(2)),
+        "fps": fps,
+        "has_audio": True,
+        "format_name": os.path.splitext(file_path)[1].lstrip(".").upper() or "VIDEO",
+    }
+
+
+@lru_cache(maxsize=256)
+def _get_audio_info_cached(
+    file_path: str,
+    file_size: int,
+    modified_ns: int,
+    ffmpeg_bin: str
+) -> Dict[str, Any]:
+    """Probe metadata once per file version; stat changes automatically miss the cache."""
+    del modified_ns  # Included in the cache key to invalidate on file changes.
 
     # Format file size
     if file_size < 1024 * 1024:

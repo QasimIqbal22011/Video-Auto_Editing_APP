@@ -1785,6 +1785,39 @@ body { background: radial-gradient(circle at 65% -15%, rgba(45, 63, 132, 0.23), 
 [data-theme="light"] .theme-toggle-btn { background: #f1f4fa; border-color: #cbd6e8; color: #6542df; }
 [data-theme="light"] .nav-item:hover:not(.disabled) { background: #f1f4fa; }
 [data-theme="light"] .nav-item.active { background: rgba(101, 66, 223, .1); }
+.clip-card { content-visibility: auto; contain-intrinsic-size: auto 64px; }
+.timeline-card { content-visibility: auto; contain-intrinsic-size: auto 210px; }
+.timeline-card-thumb { background: #071228; }
+.import-progress-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: .72rem;
+}
+.import-progress-card[hidden] { display: none; }
+.import-progress-card progress { flex: 1; min-width: 80px; height: 8px; accent-color: var(--primary-solid); }
+.clip-card { content-visibility: auto; contain-intrinsic-size: auto 64px; }
+.timeline-card { content-visibility: auto; contain-intrinsic-size: auto 210px; }
+.timeline-card-thumb { background: #071228; }
+.import-progress-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: .72rem;
+}
+.import-progress-card progress { flex: 1; min-width: 80px; height: 8px; accent-color: var(--primary-solid); }
 
 
 

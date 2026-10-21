@@ -26,6 +26,15 @@ def test_silence():
 
     remover = AudioSilenceRemover()
 
+    # The preview estimate and export must account for retained safety margins,
+    # rather than subtracting the full detected-silence total.
+    kept_with_margin = remover.compute_retained_intervals(
+        [{'start': 2.0, 'end': 4.0, 'duration': 2.0}],
+        total_duration=6.0,
+        margin_ms=80.0,
+    )
+    assert abs(sum(end - start for start, end in kept_with_margin) - 4.16) < 0.01
+
     def prog(pct, msg):
         print(f"[{pct:5.1f}%] {msg}")
 
@@ -62,6 +71,7 @@ def test_silence():
     assert res['silence_count'] >= 1
     assert res['trimmed_duration'] < in_info['duration']
     print("\nSILENCE REMOVAL TEST PASSED PERFECTLY!")
+
 
 if __name__ == '__main__':
     test_silence()

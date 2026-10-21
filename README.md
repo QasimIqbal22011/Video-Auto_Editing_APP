@@ -65,6 +65,7 @@ git lfs pull
 - Python 3.11+
 - Git LFS 3+
 - WebView2 Runtime on Windows for the native desktop window
+- Rust 1.97+ and the Visual C++ Build Tools (for the frame-by-frame GPU renderer)
 
 Create the Python environment and install dependencies:
 
@@ -82,6 +83,27 @@ python src/main.py
 ```
 
 The app prefers `resources\ffmpeg-full\bin\ffmpeg.exe` automatically.
+On Windows, when NVENC is enabled and available, the renderer keeps each
+composed frame in a Direct3D 12 texture and hands it directly to NVENC. Only
+the compressed H.264 bitstream goes to FFmpeg, which timestamps/muxes it with
+AAC audio. The renderer keeps a bounded eight-texture/bitstream pool; PNG/JPEG
+decoding and audio encode/mux remain CPU work. If Direct3D 12/NVENC setup fails,
+the app automatically falls back to its established FFmpeg renderer. Set
+`VIDEOHELPER_DISABLE_RUST_RENDERER=1` to force that compatibility path.
+`build_exe.py` builds the Rust sidecar before packaging the desktop app.
+
+The optional hardware regression can render the full 12:25.88 / 280-image
+timeline at 1080p60 (about 44,753 frames) on an NVIDIA Windows machine:
+
+```powershell
+$env:VIDEOHELPER_TEST_FULL_1080P_DIRECT = "1"
+python tests/test_timeline.py
+```
+
+On the development RTX 3060, that synthetic alternating-image fixture rendered
+in 115.2 seconds (6.48x real time). It verifies the full frame count, duration,
+and timestamp order; it is a benchmark fixture, not a guaranteed time for every
+real image set.
 
 ### 4. Run the packaged executable
 

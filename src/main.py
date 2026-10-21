@@ -3,7 +3,8 @@ import sys
 import socket
 import threading
 import webview
-from wsgiref.simple_server import make_server, WSGIRequestHandler
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import make_server, WSGIRequestHandler, WSGIServer
 
 # Ensure project root is in sys.path
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -13,11 +14,18 @@ if BASE_DIR not in sys.path:
 from src.core.logger import log_info, log_error
 from src.gui.server import create_app
 from src.gui.api_bridge import ApiBridge
+from src.gui.media_access import MediaPathRegistry
 
 class SilentWSGIRequestHandler(WSGIRequestHandler):
     """Suppresses standard console request logging for a cleaner terminal output."""
     def log_message(self, format, *args):
         pass
+
+
+class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
+    """Serve independent media/API requests concurrently for responsive previews."""
+    daemon_threads = True
+    block_on_close = False
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -25,7 +33,13 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 def run_server(app, host: str, port: int):
-    server = make_server(host, port, app, handler_class=SilentWSGIRequestHandler)
+    server = make_server(
+        host,
+        port,
+        app,
+        server_class=ThreadedWSGIServer,
+        handler_class=SilentWSGIRequestHandler
+    )
     server.serve_forever()
 
 def main():
@@ -35,7 +49,8 @@ def main():
     else:
         web_dir = os.path.join(BASE_DIR, 'src', 'gui', 'web')
 
-    app = create_app(web_dir)
+    media_registry = MediaPathRegistry()
+    app = create_app(web_dir, media_registry)
     port = find_free_port()
     host = '127.0.0.1'
 
@@ -44,7 +59,7 @@ def main():
     server_thread.start()
 
     # Initialize PyWebView JS API Bridge
-    bridge = ApiBridge()
+    bridge = ApiBridge(media_registry)
 
     # Create native standalone desktop window (matches OpenVox desktop shell)
     window = webview.create_window(

@@ -9,6 +9,7 @@ dist/
 build_*/
 dist_*/
 *.spec.bak
+rust_renderer/target/
 
 # Local Python environments and visual analysis artifacts
 .venv/
